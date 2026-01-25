@@ -30,6 +30,7 @@ FrameData :: struct {
 	present_semaphore: vk.Semaphore,
 	in_flight_fence:   vk.Fence,
 	descriptor_pool:   vk.DescriptorPool,
+	ui_target:         RenderTarget2D,
 }
 
 Allocators :: struct {
@@ -46,13 +47,26 @@ WindowContext :: struct {
 	width:         i32,
 	height:        i32,
 	swapchain:     SwapchainData,
-	frames:        []FrameData,
+	frames:        [FRAMES_IN_FLIGHT]FrameData,
 	current_frame: int,
 }
 
 QueueData :: struct {
 	queue: vk.Queue,
 	index: u32,
+}
+
+ImmediateData :: struct {
+	cmd_pool:   vk.CommandPool,
+	cmd_buffer: vk.CommandBuffer,
+	fence:      vk.Fence,
+}
+
+RenderTarget2D :: AllocatedImage
+
+RenderTarget3D :: struct {
+	color: AllocatedImage,
+	depth: AllocatedImage,
 }
 
 RenderContext :: struct {
@@ -63,17 +77,99 @@ RenderContext :: struct {
 	compute_queue:          QueueData,
 	transfer_queue:         QueueData,
 	window:                 WindowContext,
-	immediate_cmd_pool:     vk.CommandPool,
+	immediate:              ImmediateData,
 	global_descriptor_pool: vk.DescriptorPool,
 	current_frame:          int,
 	resize_requested:       bool,
+	render_config:          RenderConfig,
+	render_extent:          [2]u32,
+}
+
+DisplayMode :: enum {
+	Windowed,
+	Fullscreen,
+	BorderlessWindowed,
+}
+
+RenderQuality :: enum {
+	Low,
+	Medium,
+	High,
+	Ultra,
+	Custom,
 }
 
 RenderConfig :: struct {
-	app_name:     cstring,
-	app_version:  [3]u32,
-	init_extent:  [2]i32,
-	window_flags: sdl.WindowFlags,
+	app_name:              cstring,
+	app_version:           [3]u32,
+	init_extent:           [2]i32,
+	window_flags:          sdl.WindowFlags,
+	display_mode:          DisplayMode,
+	render_quality:        RenderQuality,
+	custom_render_scale:   f32,
+	min_render_resolution: [2]u32,
+	max_render_resolution: [2]u32,
+}
+
+create_render_config :: proc() -> (c: RenderConfig) {
+	c.app_name = "Change Me!"
+	c.app_version = {0, 1, 0}
+	c.init_extent = {640, 480}
+	c.window_flags = {.BORDERLESS, .VULKAN}
+	c.display_mode = .BorderlessWindowed
+	c.render_quality = .High
+	c.custom_render_scale = 1
+	c.min_render_resolution = {640, 360}
+	c.max_render_resolution = {3840, 2160}
+
+	return
+}
+
+render_config_set_appname :: proc(c: ^RenderConfig, name: cstring) {
+	c.app_name = name
+}
+
+render_config_set_app_version :: proc(c: ^RenderConfig, major, minor, patch: u32) {
+	c.app_version = {major, minor, patch}
+}
+
+render_config_set_window_size :: proc(c: ^RenderConfig, #any_int width, height: i32) {
+	c.init_extent = {width, height}
+}
+
+render_config_set_display_mode :: proc(c: ^RenderConfig, mode: DisplayMode) {
+	switch c.display_mode {
+	case .Windowed:
+	case .BorderlessWindowed:
+		c.window_flags &~= {.BORDERLESS}
+	case .Fullscreen:
+		c.window_flags &~= {.FULLSCREEN}
+	}
+
+	c.display_mode = mode
+	switch c.display_mode {
+	case .Windowed:
+	case .BorderlessWindowed:
+		c.window_flags |= {.BORDERLESS}
+	case .Fullscreen:
+		c.window_flags |= {.FULLSCREEN}
+	}
+}
+
+render_config_set_resizeable :: proc(c: ^RenderConfig, resizeable: bool) {
+	if resizeable {
+		c.window_flags |= {.RESIZABLE}
+	} else {
+		c.window_flags &~= {.RESIZABLE}
+	}
+}
+
+render_config_set_render_quality :: proc(c: ^RenderConfig, quality: RenderQuality) {
+	c.render_quality = quality
+}
+
+render_config_set_custom_render_scale :: proc(c: ^RenderConfig, scale: f32) {
+	c.custom_render_scale = scale
 }
 
 init_renderer :: proc(
@@ -85,6 +181,10 @@ init_renderer :: proc(
 ) {
 	log.debug("Initializing Renderer")
 	r.allocators.cpu = allocator
+
+	render_extent: [2]i32
+	r.render_config = config
+	update_render_dimensions(r)
 
 	init_sdl(r, config) or_return
 	defer if !ok do cleanup_sdl(r)
@@ -101,6 +201,9 @@ init_renderer :: proc(
 	create_frame_data(r)
 	defer if !ok do destroy_frame_data(r)
 
+	create_immediate_data(r) or_return
+	defer if !ok do destroy_immediate_data(r)
+
 	log.info("Renderer initialized")
 
 	return true
@@ -108,6 +211,7 @@ init_renderer :: proc(
 
 cleanup_renderer :: proc(r: ^RenderContext) {
 	vk.DeviceWaitIdle(r.device.device)
+	destroy_immediate_data(r)
 	destroy_frame_data(r)
 	destroy_swapchain_data(r)
 	destroy_swapchain(r)
@@ -133,14 +237,67 @@ get_current_frame :: proc(r: ^RenderContext) -> (frame: ^FrameData) {
 }
 
 get_window_size :: proc(r: ^RenderContext) -> (width, height: i32) {
-	return r.window.width, r.window.height
+	sdl.GetWindowSize(r.window.handle, &width, &height)
+	return
+}
+
+@(private)
+get_scale_from_quality :: proc(quality: RenderQuality, custom_scale: f32) -> f32 {
+	switch quality {
+	case .Low:
+		return 0.5
+	case .Medium:
+		return 0.75
+	case .High:
+		return 1.0
+	case .Ultra:
+		return 1.5
+	case .Custom:
+		return custom_scale
+	}
+	return 1.0
+}
+
+@(private)
+update_render_dimensions :: proc(r: ^RenderContext) {
+	render_scale := get_scale_from_quality(
+		r.render_config.render_quality,
+		r.render_config.custom_render_scale,
+	)
+
+	desired_width := u32(f32(r.window.width) * render_scale)
+	desired_height := u32(f32(r.window.height) * render_scale)
+
+	r.render_extent.x = clamp(
+		desired_width,
+		r.render_config.min_render_resolution.x,
+		r.render_config.max_render_resolution.x,
+	)
+	r.render_extent.y = clamp(
+		desired_height,
+		r.render_config.min_render_resolution.y,
+		r.render_config.max_render_resolution.y,
+	)
+
+	log.debugf(
+		"Render resolution: %vx%v (scale: %.2f)",
+		r.render_extent.x,
+		r.render_extent.y,
+		render_scale,
+	)
 }
 
 handle_resize :: proc(r: ^RenderContext) {
-	width, height := get_window_size(r)
-	log.debugf("Handling resize to %vx%v", width, height)
+	r.window.width, r.window.height = get_window_size(r)
+	log.debugf("Handling resize to %vx%v", r.window.width, r.window.height)
+
 	vk.DeviceWaitIdle(r.device.device)
-	resize_swapchain(r, u32(width), u32(height))
+
+	update_render_dimensions(r)
+
+	resize_swapchain(r, u32(r.window.width), u32(r.window.height))
+	resize_render_targets(r)
+
 	r.resize_requested = false
 }
 
@@ -223,31 +380,12 @@ submit_frame :: proc(r: ^RenderContext) {
 }
 
 begin_rendering :: proc(r: ^RenderContext, buf: vk.CommandBuffer) {
-	barrier := vk.ImageMemoryBarrier2 {
-		sType = .IMAGE_MEMORY_BARRIER_2,
-		srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
-		srcAccessMask = {},
-		dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
-		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
-		oldLayout = .UNDEFINED,
-		newLayout = .COLOR_ATTACHMENT_OPTIMAL,
-		image = r.window.swapchain.images[r.window.swapchain.current_index],
-		subresourceRange = {
-			aspectMask = {.COLOR},
-			baseMipLevel = 0,
-			levelCount = 1,
-			baseArrayLayer = 0,
-			layerCount = 1,
-		},
-	}
-
-	dep_info: vk.DependencyInfo = {
-		sType                   = .DEPENDENCY_INFO,
-		imageMemoryBarrierCount = 1,
-		pImageMemoryBarriers    = &barrier,
-	}
-
-	vk.CmdPipelineBarrier2(buf, &dep_info)
+	transition_image(
+		buf,
+		r.window.swapchain.images[r.window.swapchain.current_index],
+		.UNDEFINED,
+		.COLOR_ATTACHMENT_OPTIMAL,
+	)
 
 	clear_value: vk.ClearValue = {
 		color = vk.ClearColorValue{float32 = [4]f32{f32(r.current_frame) / 1000.0, 0.0, 0.0, 0.0}},
@@ -281,31 +419,12 @@ begin_rendering :: proc(r: ^RenderContext, buf: vk.CommandBuffer) {
 end_rendering :: proc(r: ^RenderContext, buf: vk.CommandBuffer) {
 	vk.CmdEndRendering(buf)
 
-	barrier := vk.ImageMemoryBarrier2 {
-		sType = .IMAGE_MEMORY_BARRIER_2,
-		srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
-		srcAccessMask = {.COLOR_ATTACHMENT_WRITE},
-		dstStageMask = {.BOTTOM_OF_PIPE},
-		dstAccessMask = {},
-		oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
-		newLayout = .PRESENT_SRC_KHR,
-		image = r.window.swapchain.images[r.window.swapchain.current_index],
-		subresourceRange = {
-			aspectMask = {.COLOR},
-			baseMipLevel = 0,
-			levelCount = 1,
-			baseArrayLayer = 0,
-			layerCount = 1,
-		},
-	}
-
-	dep_info: vk.DependencyInfo = {
-		sType                   = .DEPENDENCY_INFO,
-		imageMemoryBarrierCount = 1,
-		pImageMemoryBarriers    = &barrier,
-	}
-
-	vk.CmdPipelineBarrier2(buf, &dep_info)
+	transition_image(
+		buf,
+		r.window.swapchain.images[r.window.swapchain.current_index],
+		.COLOR_ATTACHMENT_OPTIMAL,
+		.PRESENT_SRC_KHR,
+	)
 }
 
 @(private)
@@ -326,6 +445,7 @@ init_sdl :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 		return
 	}
 	defer if !ok do sdl.DestroyWindow(r.window.handle)
+	vk.load_proc_addresses(rawptr(sdl.Vulkan_GetVkGetInstanceProcAddr()))
 
 	sdl.GetWindowSize(r.window.handle, &r.window.width, &r.window.height) or_return
 	sdl.GetWindowPosition(r.window.handle, &r.window.x, &r.window.y) or_return
@@ -387,6 +507,7 @@ init_vulkan :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 	}
 	defer if !ok do vkb.destroy_instance(vkb_instance)
 	r.instance = vkb_instance
+	vk.load_proc_addresses_instance(r.instance.instance)
 	log.debug(" - Vulkan instance created successfully")
 
 	if !sdl.Vulkan_CreateSurface(r.window.handle, r.instance.instance, nil, &r.window.surface) {
@@ -422,8 +543,6 @@ init_vulkan :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 		vk.PhysicalDeviceVulkan12Features {
 			sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 			descriptorIndexing = true,
-			descriptorBindingVariableDescriptorCount = true,
-			runtimeDescriptorArray = true,
 			bufferDeviceAddress = true,
 		},
 	)
@@ -471,6 +590,7 @@ init_vulkan :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 	}
 	defer if !ok do vkb.destroy_device(vkb_device)
 	r.device = vkb_device
+	vk.load_proc_addresses_device(r.device.device)
 	log.debug(" - Logical device created successfully")
 
 	get_device_queue(&r.graphics_queue, vkb_device, .Graphics) or_return
@@ -478,6 +598,11 @@ init_vulkan :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 	get_device_queue(&r.transfer_queue, vkb_device, .Transfer) or_return
 
 	vulkan_functions := vma.create_vulkan_functions()
+	vulkan_functions.get_buffer_memory_requirements2_khr = vk.GetBufferMemoryRequirements2
+	vulkan_functions.get_image_memory_requirements2_khr = vk.GetImageMemoryRequirements2
+	vulkan_functions.bind_buffer_memory2_khr = vk.BindBufferMemory2
+	vulkan_functions.bind_image_memory2_khr = vk.BindImageMemory2
+
 	alloc_info := vma.Allocator_Create_Info {
 		vulkan_api_version = VK_VERSION,
 		physical_device    = r.device.physical_device.physical_device,
@@ -488,7 +613,6 @@ init_vulkan :: proc(r: ^RenderContext, config: RenderConfig) -> (ok: bool) {
 	}
 
 	vk_check(vma.create_allocator(alloc_info, &r.allocators.gpu))
-	log.debug(" - VMA Allocator created successfully")
 
 	log.debug(" - Vulkan initialized successfully")
 	return true
@@ -607,6 +731,7 @@ create_swapchain_data :: proc(r: ^RenderContext) -> (ok: bool) {
 
 @(private)
 destroy_swapchain_data :: proc(r: ^RenderContext) {
+	log.debug("Destroying Swapchain Data")
 	for sem in r.window.swapchain.render_semaphores {
 		vk.DestroySemaphore(r.device.device, sem, nil)
 	}
@@ -619,7 +744,6 @@ destroy_swapchain_data :: proc(r: ^RenderContext) {
 @(private)
 create_frame_data :: proc(r: ^RenderContext) {
 	log.debug("Creating FrameData")
-	r.window.frames = make([]FrameData, FRAMES_IN_FLIGHT, r.allocators.cpu)
 
 	cmd_pool_info: vk.CommandPoolCreateInfo = {
 		sType            = .COMMAND_POOL_CREATE_INFO,
@@ -677,6 +801,13 @@ create_frame_data :: proc(r: ^RenderContext) {
 				&frame_data.descriptor_pool,
 			),
 		)
+
+		frame_data.ui_target = create_image(
+			r,
+			vk.Extent3D{width = r.render_extent.x, height = r.render_extent.y, depth = 1},
+			.R8G8B8A8_SRGB,
+			{.COLOR_ATTACHMENT, .SAMPLED},
+		)
 	}
 }
 
@@ -688,8 +819,22 @@ destroy_frame_data :: proc(r: ^RenderContext) {
 		vk.DestroyFence(r.device.device, frame_data.in_flight_fence, nil)
 		vk.DestroySemaphore(r.device.device, frame_data.present_semaphore, nil)
 		vk.DestroyCommandPool(r.device.device, frame_data.cmd_pool, nil)
+		destroy_image(r, frame_data.ui_target)
 	}
-	delete(r.window.frames)
+}
+
+@(private)
+resize_render_targets :: proc(r: ^RenderContext) {
+	log.debug("Destroying FrameData")
+	for &frame_data in r.window.frames {
+		destroy_image(r, frame_data.ui_target)
+		frame_data.ui_target = create_image(
+			r,
+			vk.Extent3D{width = r.render_extent.x, height = r.render_extent.y, depth = 1},
+			.R8G8B8A8_SRGB,
+			{.COLOR_ATTACHMENT, .SAMPLED},
+		)
+	}
 }
 
 @(private)
@@ -701,4 +846,43 @@ resize_swapchain :: proc(r: ^RenderContext, width, height: u32) -> (ok: bool) {
 	create_swapchain_data(r) or_return
 
 	return true
+}
+
+@(private)
+create_immediate_data :: proc(r: ^RenderContext) -> (ok: bool) {
+	log.debug("Creating ImmediateData")
+
+	cmd_pool_info: vk.CommandPoolCreateInfo = {
+		sType            = .COMMAND_POOL_CREATE_INFO,
+		flags            = {.TRANSIENT, .RESET_COMMAND_BUFFER},
+		queueFamilyIndex = r.graphics_queue.index,
+	}
+
+	vk_check(vk.CreateCommandPool(r.device.device, &cmd_pool_info, nil, &r.immediate.cmd_pool))
+
+	cmd_buffer_info: vk.CommandBufferAllocateInfo = {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = r.immediate.cmd_pool,
+		level              = .PRIMARY,
+		commandBufferCount = 1,
+	}
+
+	vk_check(vk.AllocateCommandBuffers(r.device.device, &cmd_buffer_info, &r.immediate.cmd_buffer))
+
+	fence_info: vk.FenceCreateInfo = {
+		sType = .FENCE_CREATE_INFO,
+		flags = {},
+	}
+
+	vk_check(vk.CreateFence(r.device.device, &fence_info, nil, &r.immediate.fence))
+
+	log.debug(" - ImmediateData created successfully")
+	return true
+}
+
+@(private)
+destroy_immediate_data :: proc(r: ^RenderContext) {
+	vk.DestroyFence(r.device.device, r.immediate.fence, nil)
+	vk.DestroyCommandPool(r.device.device, r.immediate.cmd_pool, nil)
+	log.debug("ImmediateData destroyed")
 }

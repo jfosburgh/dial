@@ -40,19 +40,14 @@ main :: proc() {
 	}
 	context.logger = log.create_console_logger(level)
 
+	config := gfx.create_render_config()
+	gfx.render_config_set_resizeable(&config, true)
+	gfx.render_config_set_appname(&config, "Hello Triangle")
+	gfx.render_config_set_app_version(&config, 0, 1, 0)
+	gfx.render_config_set_window_size(&config, WIDTH, HEIGHT)
+
 	renderer: gfx.RenderContext
-	assert(
-		gfx.init_renderer(
-			&renderer,
-			{
-				init_extent = {WIDTH, HEIGHT},
-				app_name = "Hello Triangle",
-				app_version = {1, 0, 0},
-				window_flags = {.RESIZABLE, .BORDERLESS},
-			},
-			context.allocator,
-		),
-	)
+	assert(gfx.init_renderer(&renderer, config, context.allocator))
 
 	loop: for {
 		e: sdl.Event
@@ -64,6 +59,43 @@ main :: proc() {
 			case .WINDOW_RESIZED:
 				log.debugf("Window resized to %vx%v", e.window.data1, e.window.data2)
 				renderer.resize_requested = true
+			case .KEY_UP:
+				#partial switch e.key.scancode {
+				case .ESCAPE:
+					break loop
+				case .LEFTBRACKET:
+					next_quality: gfx.RenderQuality
+					switch renderer.render_config.render_quality {
+					case .Low:
+						continue
+					case .Medium:
+						next_quality = .Low
+					case .High:
+						next_quality = .Medium
+					case .Ultra:
+						next_quality = .High
+					case .Custom:
+						next_quality = .Ultra
+					}
+					gfx.render_config_set_render_quality(&renderer.render_config, next_quality)
+					renderer.resize_requested = true
+				case .RIGHTBRACKET:
+					next_quality: gfx.RenderQuality
+					switch renderer.render_config.render_quality {
+					case .Low:
+						next_quality = .Medium
+					case .Medium:
+						next_quality = .High
+					case .High:
+						next_quality = .Ultra
+					case .Ultra:
+						next_quality = .Custom
+					case .Custom:
+						continue
+					}
+					gfx.render_config_set_render_quality(&renderer.render_config, next_quality)
+					renderer.resize_requested = true
+				}
 			}
 		}
 
