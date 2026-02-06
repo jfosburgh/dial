@@ -1,0 +1,2 @@
+slangc src/gfx/vk/default_shaders/triangle.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/triangle.spv
+slangc src/gfx/vk/default_shaders/buffer_triangle.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/buffer_triangle.spv

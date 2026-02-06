@@ -1,0 +1,1331 @@
+package gfx
+
+import "base:runtime"
+import "core:log"
+import "core:mem"
+import "core:slice"
+
+import "shared:vma"
+import sdl "vendor:sdl3"
+import vk "vendor:vulkan"
+
+WIDTH :: 1280
+HEIGHT :: 720
+
+FRAMES_IN_FLIGHT :: 2
+
+ENABLE_DEBUG_MESSENGER :: true
+
+REQUIRED_DEVICE_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+
+WindowConfig :: struct {
+	window_title, app_id: cstring,
+	width, height:        i32,
+	window_flags:         sdl.WindowFlags,
+}
+
+Allocators :: struct {
+	cpu:  runtime.Allocator,
+	gpu:  vma.Allocator,
+	temp: runtime.Allocator,
+}
+
+Swapchain :: struct {
+	handle:     vk.SwapchainKHR,
+	format:     vk.Format,
+	extent:     vk.Extent2D,
+	images:     []vk.Image,
+	views:      []vk.ImageView,
+	semaphores: []vk.Semaphore,
+}
+
+FrameData :: struct {
+	buffer:    vk.CommandBuffer,
+	semaphore: vk.Semaphore,
+	fence:     vk.Fence,
+}
+
+Renderer :: struct {
+	allocators:                    Allocators,
+	ctx:                           runtime.Context,
+	window:                        ^sdl.Window,
+	instance:                      vk.Instance,
+	debug_messenger:               vk.DebugUtilsMessengerEXT,
+	physical_device:               vk.PhysicalDevice,
+	device:                        vk.Device,
+	surface:                       vk.SurfaceKHR,
+	graphics_queue:                vk.Queue,
+	present_queue:                 vk.Queue,
+	graphics_index, present_index: u32,
+	swapchain:                     Swapchain,
+	graphics_pipeline:             vk.Pipeline,
+	graphics_pipeline_layout:      vk.PipelineLayout,
+	command_pool:                  vk.CommandPool,
+	frames:                        [FRAMES_IN_FLIGHT]FrameData,
+	frame_index:                   uint,
+	resize_requested:              bool,
+	vertex_buffer:                 AllocatedBuffer,
+}
+
+r: ^Renderer
+
+AllocatedBuffer :: struct {
+	buffer:     vk.Buffer,
+	allocation: vma.Allocation,
+}
+
+Vertex :: struct {
+	pos:   [2]f32,
+	color: [3]f32,
+}
+
+get_vertex_binding_description :: proc() -> vk.VertexInputBindingDescription {
+	return {inputRate = .VERTEX, stride = size_of(Vertex), binding = 0}
+}
+
+get_vertex_attribute_descriptions :: proc(
+) -> (
+	attributes: [2]vk.VertexInputAttributeDescription,
+) {
+	return {
+		{binding = 0, location = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
+		{
+			binding = 0,
+			location = 1,
+			format = .R32G32B32_SFLOAT,
+			offset = u32(offset_of(Vertex, color)),
+		},
+	}
+}
+
+triangle_vertices: []Vertex = {
+	{{-0.5, -0.5}, {1.0, 0.0, 0.0}},
+	{{0.5, -0.5}, {0.0, 1.0, 0.0}},
+	{{0.5, 0.5}, {0.0, 0.0, 1.0}},
+	{{-0.5, 0.5}, {1.0, 1.0, 1.0}},
+}
+
+triangle_indices: []u16 = {0, 1, 2, 2, 3, 0}
+
+vk_check :: proc(res: vk.Result, loc := #caller_location) {
+	#partial switch res {
+	case .SUCCESS:
+	case:
+		log.fatalf("Vulkan Error: %v", res, loc)
+	}
+}
+
+// from Odin Vulkan example
+// https://github.com/odin-lang/examples/blob/master/vulkan/triangle_glfw/main.odin
+@(private)
+vk_messenger_callback :: proc "system" (
+	messageSeverity: vk.DebugUtilsMessageSeverityFlagsEXT,
+	messageTypes: vk.DebugUtilsMessageTypeFlagsEXT,
+	pCallbackData: ^vk.DebugUtilsMessengerCallbackDataEXT,
+	pUserData: rawptr,
+) -> b32 {
+	context = r.ctx
+
+	level: log.Level
+	if .ERROR in messageSeverity {
+		level = .Error
+	} else if .WARNING in messageSeverity {
+		level = .Warning
+	} else if .INFO in messageSeverity {
+		level = .Info
+	} else {
+		level = .Debug
+	}
+
+	log.logf(level, "vulkan[%v]: %s", messageTypes, pCallbackData.pMessage)
+	return false
+}
+
+@(private)
+log_sdl :: proc() {
+	log.errorf("SDL Error: %s", sdl.GetError())
+}
+
+@(private)
+current_frame :: proc() -> FrameData {
+	return r.frames[r.frame_index % FRAMES_IN_FLIGHT]
+}
+
+request_resize :: proc() {
+	r.resize_requested = true
+}
+
+@(private)
+init_window :: proc(c: WindowConfig) -> (ok: bool) {
+	sdl.SetAppMetadataProperty(sdl.PROP_APP_METADATA_IDENTIFIER_STRING, c.app_id) or_return
+	sdl.Init({.VIDEO, .EVENTS}) or_return
+	defer if !ok do sdl.Quit()
+
+	sdl.Vulkan_LoadLibrary(nil) or_return
+	defer if !ok do sdl.Vulkan_UnloadLibrary()
+
+	vk.load_proc_addresses_global(rawptr(sdl.Vulkan_GetVkGetInstanceProcAddr()))
+	r.window = sdl.CreateWindow(c.window_title, c.width, c.height, c.window_flags)
+	if r.window == nil {
+		log_sdl()
+		return false
+	}
+
+	return true
+}
+
+@(private)
+destroy_window :: proc() {
+	sdl.DestroyWindow(r.window)
+	sdl.Quit()
+}
+
+@(private)
+create_instance :: proc() -> (ok: bool) {
+	app_info: vk.ApplicationInfo = {
+		sType              = .APPLICATION_INFO,
+		apiVersion         = vk.API_VERSION_1_4,
+		applicationVersion = vk.MAKE_VERSION(0, 1, 0),
+		engineVersion      = vk.MAKE_VERSION(0, 1, 0),
+		pEngineName        = "Dial",
+		pApplicationName   = "com.boondax.dial",
+	}
+
+	create_info: vk.InstanceCreateInfo = {
+		sType            = .INSTANCE_CREATE_INFO,
+		pApplicationInfo = &app_info,
+	}
+
+	sdl_extension_count: u32
+	sdl_extensions := sdl.Vulkan_GetInstanceExtensions(&sdl_extension_count)
+
+	required_extensions := slice.clone_to_dynamic(
+		sdl_extensions[:sdl_extension_count],
+		r.allocators.cpu,
+	)
+	defer delete(required_extensions)
+
+	debug_create_info: vk.DebugUtilsMessengerCreateInfoEXT
+	when ENABLE_DEBUG_MESSENGER {
+		create_info.ppEnabledLayerNames = raw_data([]cstring{"VK_LAYER_KHRONOS_validation"})
+		create_info.enabledLayerCount = 1
+
+		append(&required_extensions, vk.EXT_DEBUG_UTILS_EXTENSION_NAME)
+
+		severity: vk.DebugUtilsMessageSeverityFlagsEXT
+		if context.logger.lowest_level <= .Error {
+			severity |= {.ERROR}
+		}
+		if context.logger.lowest_level <= .Warning {
+			severity |= {.WARNING}
+		}
+		// if context.logger.lowest_level <= .Info {
+		// 	severity |= {.INFO}
+		// }
+		// if context.logger.lowest_level <= .Debug {
+		// 	severity |= {.VERBOSE}
+		// }
+
+		debug_create_info = vk.DebugUtilsMessengerCreateInfoEXT {
+			sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+			messageSeverity = severity,
+			messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE},
+			pfnUserCallback = vk_messenger_callback,
+		}
+		create_info.pNext = &debug_create_info
+	}
+
+	supported_extension_count: u32
+	vk_check(vk.EnumerateInstanceExtensionProperties(nil, &supported_extension_count, nil))
+	supported_extensions := make(
+		[]vk.ExtensionProperties,
+		supported_extension_count,
+		r.allocators.cpu,
+	)
+	defer delete(supported_extensions)
+	vk_check(
+		vk.EnumerateInstanceExtensionProperties(
+			nil,
+			&supported_extension_count,
+			raw_data(supported_extensions),
+		),
+	)
+
+	for required_extension in required_extensions {
+		found := false
+		for &supported_extension in supported_extensions {
+			if cstring(raw_data(supported_extension.extensionName[:])) == required_extension {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			log.fatalf("Required extension not found: %s", required_extension)
+		}
+	}
+
+	create_info.enabledExtensionCount = u32(len(required_extensions))
+	create_info.ppEnabledExtensionNames = raw_data(required_extensions)
+
+	log.debug("creating instance")
+	vk_check(vk.CreateInstance(&create_info, nil, &r.instance))
+	defer if !ok do vk.DestroyInstance(r.instance, nil)
+	log.debug("created instance")
+
+	vk.load_proc_addresses_instance(r.instance)
+
+	when ENABLE_DEBUG_MESSENGER {
+		log.debug("creating debug messenger")
+		vk_check(
+			vk.CreateDebugUtilsMessengerEXT(
+				r.instance,
+				&debug_create_info,
+				nil,
+				&r.debug_messenger,
+			),
+		)
+		log.debug("Debug messenger created")
+	}
+
+	defer if !ok {
+		when ENABLE_DEBUG_MESSENGER {
+			vk.DestroyDebugUtilsMessengerEXT(r.instance, r.debug_messenger, nil)
+		}
+	}
+
+	if !sdl.Vulkan_CreateSurface(r.window, r.instance, nil, &r.surface) {
+		log_sdl()
+		return
+	}
+
+	return true
+}
+
+@(private)
+destroy_instance :: proc() {
+	sdl.Vulkan_DestroySurface(r.instance, r.surface, nil)
+	when ENABLE_DEBUG_MESSENGER {
+		vk.DestroyDebugUtilsMessengerEXT(r.instance, r.debug_messenger, nil)
+	}
+	vk.DestroyInstance(r.instance, nil)
+}
+
+SwapchainSupport :: struct {
+	capabilities:  vk.SurfaceCapabilitiesKHR,
+	formats:       []vk.SurfaceFormatKHR,
+	present_modes: []vk.PresentModeKHR,
+}
+
+@(private)
+query_swapchain_support :: proc(
+	device: vk.PhysicalDevice,
+) -> (
+	support: SwapchainSupport,
+	ok: bool,
+) {
+	if vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(device, r.surface, &support.capabilities) != .SUCCESS do return support, false
+
+	{
+		count: u32
+		if vk.GetPhysicalDeviceSurfaceFormatsKHR(device, r.surface, &count, nil) != .SUCCESS do return support, false
+
+		support.formats = make([]vk.SurfaceFormatKHR, count, r.allocators.cpu)
+		vk.GetPhysicalDeviceSurfaceFormatsKHR(device, r.surface, &count, raw_data(support.formats))
+	}
+	defer if !ok do delete(support.formats)
+
+	{
+		count: u32
+		if vk.GetPhysicalDeviceSurfacePresentModesKHR(device, r.surface, &count, nil) != .SUCCESS do return support, false
+
+		support.present_modes = make([]vk.PresentModeKHR, count, r.allocators.cpu)
+		vk.GetPhysicalDeviceSurfacePresentModesKHR(
+			device,
+			r.surface,
+			&count,
+			raw_data(support.present_modes),
+		)
+	}
+
+	return support, true
+}
+
+QueueFamilyIndices :: struct {
+	compute:  Maybe(u32),
+	graphics: Maybe(u32),
+	present:  Maybe(u32),
+	transfer: Maybe(u32),
+}
+
+@(private)
+find_queue_families :: proc(
+	device: vk.PhysicalDevice,
+) -> (
+	indices: QueueFamilyIndices,
+	ok: bool,
+) #optional_ok {
+	queue_count: u32
+	vk.GetPhysicalDeviceQueueFamilyProperties(device, &queue_count, nil)
+
+	families := make([]vk.QueueFamilyProperties, queue_count, r.allocators.cpu)
+	vk.GetPhysicalDeviceQueueFamilyProperties(device, &queue_count, raw_data(families))
+
+	for family, i in families {
+		if _, ok := indices.compute.?; !ok && .COMPUTE in family.queueFlags {
+			indices.compute = u32(i)
+		}
+		if _, ok := indices.graphics.?; !ok && .GRAPHICS in family.queueFlags {
+			indices.graphics = u32(i)
+		}
+		if _, ok := indices.transfer.?; !ok && .TRANSFER in family.queueFlags {
+			indices.transfer = u32(i)
+		}
+
+		if _, ok := indices.present.?; !ok {
+			present_supported: b32
+			vk.GetPhysicalDeviceSurfaceSupportKHR(device, u32(i), r.surface, &present_supported)
+
+			if present_supported do indices.present = u32(i)
+		}
+
+		_, has_compute := indices.compute.?
+		_, has_graphics := indices.graphics.?
+		_, has_transfer := indices.transfer.?
+		_, has_present := indices.present.?
+
+		if has_compute && has_graphics && has_transfer && has_present {
+			ok = true
+			break
+		}
+	}
+
+	return
+}
+
+@(private)
+score_physical_device :: proc(device: vk.PhysicalDevice) -> (score: int) {
+	properties: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(device, &properties)
+
+	features: vk.PhysicalDeviceFeatures
+	vk.GetPhysicalDeviceFeatures(device, &features)
+
+	device_name := cstring(raw_data(properties.deviceName[:]))
+
+	device_ext_count: u32
+	if vk.EnumerateDeviceExtensionProperties(device, nil, &device_ext_count, nil) != .SUCCESS do return 0
+
+	device_extensions := make([]vk.ExtensionProperties, device_ext_count, r.allocators.cpu)
+	vk.EnumerateDeviceExtensionProperties(
+		device,
+		nil,
+		&device_ext_count,
+		raw_data(device_extensions),
+	)
+
+	required_loop: for required in REQUIRED_DEVICE_EXTENSIONS {
+		for &extension in device_extensions {
+			if cstring(raw_data(extension.extensionName[:])) == required do continue required_loop
+		}
+
+		log.debugf("device %s does not support extension: %s", device_name, required)
+		return 0
+	}
+
+	if swapchain_support, ok := query_swapchain_support(device); ok {
+		defer {
+			delete(swapchain_support.present_modes)
+			delete(swapchain_support.formats)
+		}
+
+		if len(swapchain_support.formats) == 0 || len(swapchain_support.present_modes) == 0 {
+			log.debugf("device %s does not support swapchain", device_name)
+			return 0
+		}
+	} else do return 0
+
+	if queue_indices, ok := find_queue_families(device); !ok {
+		log.debugf(
+			"device %s does not have required queue families: %v",
+			device_name,
+			queue_indices,
+		)
+		return 0
+	}
+
+	switch properties.deviceType {
+	case .DISCRETE_GPU:
+		score += 300_000
+	case .INTEGRATED_GPU:
+		score += 200_000
+	case .VIRTUAL_GPU:
+		score += 100_000
+	case .CPU, .OTHER:
+	}
+
+	score += int(properties.limits.maxImageDimension2D)
+
+	log.debugf("Device %s - score: %i", device_name, score)
+
+	return score
+}
+
+@(private)
+pick_physical_device :: proc() -> (ok: bool) {
+	physical_device_count: u32
+	vk_check(vk.EnumeratePhysicalDevices(r.instance, &physical_device_count, nil))
+	if physical_device_count == 0 {
+		log.fatalf("Failed to find a device that supports Vulkan")
+		return false
+	}
+
+	devices := make([]vk.PhysicalDevice, physical_device_count, r.allocators.cpu)
+	vk_check(vk.EnumeratePhysicalDevices(r.instance, &physical_device_count, raw_data(devices)))
+
+	best_score := -1
+	for device in devices {
+		if score_physical_device(device) > best_score {
+			r.physical_device = device
+		}
+	}
+
+	if r.physical_device == nil {
+		log.fatalf("No suitable devices found")
+		return false
+	}
+
+	return true
+}
+
+// TODO: [potential] add more queues
+@(private)
+create_logical_device :: proc() -> (ok: bool) {
+	indices := find_queue_families(r.physical_device) or_return
+	r.graphics_index = indices.graphics.? or_return
+	r.present_index = indices.present.? or_return
+	priority: f32 = 0.5
+
+	device_queue_create_info: vk.DeviceQueueCreateInfo = {
+		sType            = .DEVICE_QUEUE_CREATE_INFO,
+		queueCount       = 1,
+		queueFamilyIndex = r.graphics_index,
+		pQueuePriorities = &priority,
+	}
+
+	device_features: vk.PhysicalDeviceFeatures = {}
+
+	extended_dynamic_features: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT = {
+		sType                = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+		extendedDynamicState = true,
+	}
+
+	features_1_4: vk.PhysicalDeviceVulkan14Features = {
+		sType = .PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+		pNext = &extended_dynamic_features,
+	}
+
+	features_1_3: vk.PhysicalDeviceVulkan13Features = {
+		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		pNext            = &features_1_4,
+		dynamicRendering = true,
+		synchronization2 = true,
+	}
+
+	features_1_2: vk.PhysicalDeviceVulkan12Features = {
+		sType               = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+		pNext               = &features_1_3,
+		bufferDeviceAddress = true,
+	}
+
+	features_1_1: vk.PhysicalDeviceVulkan11Features = {
+		sType                = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		pNext                = &features_1_2,
+		shaderDrawParameters = true,
+	}
+
+	device_create_info: vk.DeviceCreateInfo = {
+		sType                   = .DEVICE_CREATE_INFO,
+		pNext                   = &features_1_1,
+		queueCreateInfoCount    = 1,
+		pQueueCreateInfos       = &device_queue_create_info,
+		pEnabledFeatures        = &device_features,
+		enabledExtensionCount   = u32(len(REQUIRED_DEVICE_EXTENSIONS)),
+		ppEnabledExtensionNames = raw_data(REQUIRED_DEVICE_EXTENSIONS),
+	}
+
+	vk_check(vk.CreateDevice(r.physical_device, &device_create_info, nil, &r.device))
+	vk.load_proc_addresses_device(r.device)
+	vk.GetDeviceQueue(r.device, r.graphics_index, 0, &r.graphics_queue)
+	vk.GetDeviceQueue(r.device, r.present_index, 0, &r.present_queue)
+
+	return true
+}
+
+@(private)
+destroy_logical_device :: proc() {
+	vk.DestroyDevice(r.device, nil)
+}
+
+@(private)
+create_vma :: proc() -> (ok: bool) {
+	vma_vulkan_functions := vma.create_vulkan_functions()
+	vma_vulkan_functions.get_physical_device_memory_properties2_khr =
+		vk.GetPhysicalDeviceMemoryProperties2
+	vma_vulkan_functions.get_buffer_memory_requirements2_khr = vk.GetBufferMemoryRequirements2
+	vma_vulkan_functions.get_image_memory_requirements2_khr = vk.GetImageMemoryRequirements2
+	vma_vulkan_functions.bind_buffer_memory2_khr = vk.BindBufferMemory2
+	vma_vulkan_functions.bind_image_memory2_khr = vk.BindImageMemory2
+
+	allocator_create_info: vma.Allocator_Create_Info = {
+		flags              = {.Buffer_Device_Address},
+		instance           = r.instance,
+		vulkan_api_version = vk.API_VERSION_1_4,
+		physical_device    = r.physical_device,
+		device             = r.device,
+		vulkan_functions   = &vma_vulkan_functions,
+	}
+
+	vk_check(vma.create_allocator(allocator_create_info, &r.allocators.gpu))
+
+	return true
+}
+
+@(private)
+destroy_vma :: proc() {
+	vma.destroy_allocator(r.allocators.gpu)
+}
+
+@(private)
+choose_swapchain_surface_format :: proc(
+	supported_formats: []vk.SurfaceFormatKHR,
+) -> vk.SurfaceFormatKHR {
+	for format in supported_formats {
+		if format.format == .B8G8R8A8_SRGB && format.colorSpace == .SRGB_NONLINEAR do return format
+	}
+	return supported_formats[0]
+}
+
+@(private)
+choose_swapchain_present_mode :: proc(present_modes: []vk.PresentModeKHR) -> vk.PresentModeKHR {
+	for mode in present_modes {
+		if mode == .MAILBOX do return mode
+	}
+	return .FIFO
+}
+
+@(private)
+choose_swapchain_extent :: proc(capabilities: vk.SurfaceCapabilitiesKHR) -> vk.Extent2D {
+	if capabilities.currentExtent.width != max(u32) do return capabilities.currentExtent
+
+	width, height: i32
+	if !sdl.GetWindowSize(r.window, &width, &height) {
+		log_sdl()
+		return {}
+	}
+
+	return {
+		clamp(u32(width), capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+		clamp(u32(height), capabilities.minImageExtent.height, capabilities.maxImageExtent.height),
+	}
+}
+
+@(private)
+create_swapchain :: proc() -> (ok: bool) {
+	support := query_swapchain_support(r.physical_device) or_return
+	defer {
+		delete(support.formats)
+		delete(support.present_modes)
+	}
+
+	format := choose_swapchain_surface_format(support.formats)
+	present_mode := choose_swapchain_present_mode(support.present_modes)
+	extent := choose_swapchain_extent(support.capabilities)
+	if extent.height == 0 || extent.height == 0 do return
+
+	image_count := support.capabilities.minImageCount + 1
+	image_count =
+		support.capabilities.maxImageCount if support.capabilities.maxImageCount > 0 && support.capabilities.maxImageCount > image_count else image_count
+
+	swapchain_create_info: vk.SwapchainCreateInfoKHR = {
+		sType            = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface          = r.surface,
+		presentMode      = present_mode,
+		imageExtent      = extent,
+		imageFormat      = format.format,
+		imageColorSpace  = format.colorSpace,
+		minImageCount    = image_count,
+		imageArrayLayers = 1,
+		imageUsage       = {.COLOR_ATTACHMENT}, // TODO: change to TRANSFER if using separate render target
+		imageSharingMode = .EXCLUSIVE,
+		preTransform     = support.capabilities.currentTransform,
+		compositeAlpha   = {.OPAQUE},
+		clipped          = true,
+	}
+
+	indices: [2]u32 = {r.graphics_index, r.present_index}
+	if r.graphics_index != r.present_index {
+		swapchain_create_info.imageSharingMode = .CONCURRENT
+		swapchain_create_info.queueFamilyIndexCount = 2
+		swapchain_create_info.pQueueFamilyIndices = raw_data(indices[:])
+	}
+
+	vk_check(vk.CreateSwapchainKHR(r.device, &swapchain_create_info, nil, &r.swapchain.handle))
+	defer if !ok do vk.DestroySwapchainKHR(r.device, r.swapchain.handle, nil)
+
+	vk_check(vk.GetSwapchainImagesKHR(r.device, r.swapchain.handle, &image_count, nil))
+	r.swapchain.images = make([]vk.Image, image_count, r.allocators.cpu)
+	vk_check(
+		vk.GetSwapchainImagesKHR(
+			r.device,
+			r.swapchain.handle,
+			&image_count,
+			raw_data(r.swapchain.images),
+		),
+	)
+
+	r.swapchain.extent = extent
+	r.swapchain.format = format.format
+
+	return true
+}
+
+@(private)
+destroy_swapchain :: proc() {
+	delete(r.swapchain.images)
+	vk.DestroySwapchainKHR(r.device, r.swapchain.handle, nil)
+}
+
+@(private)
+create_swapchain_data :: proc() -> (ok: bool) {
+	image_view_create_info: vk.ImageViewCreateInfo = {
+		sType = .IMAGE_VIEW_CREATE_INFO,
+		format = r.swapchain.format,
+		viewType = .D2,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseArrayLayer = 0,
+			baseMipLevel = 0,
+			layerCount = 1,
+			levelCount = 1,
+		},
+		components = {a = .IDENTITY, b = .IDENTITY, g = .IDENTITY, r = .IDENTITY},
+	}
+
+	r.swapchain.views = make([]vk.ImageView, len(r.swapchain.images), r.allocators.cpu)
+	r.swapchain.semaphores = make([]vk.Semaphore, len(r.swapchain.images), r.allocators.cpu)
+	for i in 0 ..< len(r.swapchain.images) {
+		image_view_create_info.image = r.swapchain.images[i]
+		vk_check(vk.CreateImageView(r.device, &image_view_create_info, nil, &r.swapchain.views[i]))
+		vk_check(
+			vk.CreateSemaphore(
+				r.device,
+				&vk.SemaphoreCreateInfo{sType = .SEMAPHORE_CREATE_INFO},
+				nil,
+				&r.swapchain.semaphores[i],
+			),
+		)
+	}
+
+	return true
+}
+
+@(private)
+destroy_swapchain_data :: proc() {
+	for view in r.swapchain.views {
+		vk.DestroyImageView(r.device, view, nil)
+	}
+	for semaphore in r.swapchain.semaphores {
+		vk.DestroySemaphore(r.device, semaphore, nil)
+	}
+	delete(r.swapchain.views)
+	delete(r.swapchain.semaphores)
+}
+
+@(private)
+recreate_swapchain :: proc() {
+	width, height: i32
+	sdl.GetWindowSize(r.window, &width, &height)
+	if width == 0 || height == 0 {
+		log.debug("window minimized, waiting")
+	}
+
+	for width == 0 || height == 0 {
+		sdl.GetWindowSize(r.window, &width, &height)
+		for sdl.WaitEvent(nil) {}
+	}
+
+	log.debugf("resizing swapchain to %dx%d", width, height)
+	vk_check(vk.DeviceWaitIdle(r.device))
+
+	destroy_swapchain_data()
+	destroy_swapchain()
+
+	create_swapchain()
+	create_swapchain_data()
+}
+
+@(private)
+create_shader_module :: proc(code: []byte) -> (shader: vk.ShaderModule) {
+	as_u32 := slice.reinterpret([]u32, code)
+	create_info: vk.ShaderModuleCreateInfo = {
+		sType    = .SHADER_MODULE_CREATE_INFO,
+		codeSize = len(as_u32) * size_of(u32),
+		pCode    = raw_data(as_u32),
+	}
+
+	vk_check(vk.CreateShaderModule(r.device, &create_info, nil, &shader))
+	return
+}
+
+@(private)
+create_graphics_pipeline :: proc() -> (ok: bool) {
+	shader_code := #load("./default_shaders/buffer_triangle.spv")
+	shader_module := create_shader_module(shader_code)
+	defer vk.DestroyShaderModule(r.device, shader_module, nil)
+
+	vert_stage_info: vk.PipelineShaderStageCreateInfo = {
+		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+		module = shader_module,
+		stage  = {.VERTEX},
+		pName  = "vertMain",
+	}
+
+	frag_stage_info: vk.PipelineShaderStageCreateInfo = {
+		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+		module = shader_module,
+		stage  = {.FRAGMENT},
+		pName  = "fragMain",
+	}
+
+	stages := [2]vk.PipelineShaderStageCreateInfo{vert_stage_info, frag_stage_info}
+
+	dynamic_states: [2]vk.DynamicState = {.VIEWPORT, .SCISSOR}
+	dynamic_state: vk.PipelineDynamicStateCreateInfo = {
+		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		dynamicStateCount = u32(len(dynamic_states)),
+		pDynamicStates    = raw_data(dynamic_states[:]),
+	}
+
+	binding_description := get_vertex_binding_description()
+	attribute_description := get_vertex_attribute_descriptions()
+	vertex_input_info: vk.PipelineVertexInputStateCreateInfo = {
+		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount   = 1,
+		pVertexBindingDescriptions      = &binding_description,
+		vertexAttributeDescriptionCount = u32(len(attribute_description)),
+		pVertexAttributeDescriptions    = &attribute_description[0],
+	}
+
+	input_assembly: vk.PipelineInputAssemblyStateCreateInfo = {
+		sType    = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		topology = .TRIANGLE_LIST,
+	}
+
+	viewport_state: vk.PipelineViewportStateCreateInfo = {
+		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		scissorCount  = 1,
+		viewportCount = 1,
+	}
+
+	rasterizer: vk.PipelineRasterizationStateCreateInfo = {
+		sType                   = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		depthClampEnable        = false,
+		rasterizerDiscardEnable = false,
+		polygonMode             = .FILL,
+		cullMode                = {.BACK},
+		frontFace               = .CLOCKWISE,
+		depthBiasEnable         = false,
+		depthBiasSlopeFactor    = 1,
+		lineWidth               = 1,
+	}
+
+	multisampling: vk.PipelineMultisampleStateCreateInfo = {
+		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		rasterizationSamples = {._1},
+		sampleShadingEnable  = false,
+	}
+
+	color_blend_attachment: vk.PipelineColorBlendAttachmentState = {
+		blendEnable    = false,
+		colorWriteMask = {.R, .G, .B, .A},
+	}
+
+	color_blend_state: vk.PipelineColorBlendStateCreateInfo = {
+		sType           = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		logicOpEnable   = false,
+		logicOp         = .COPY,
+		attachmentCount = 1,
+		pAttachments    = &color_blend_attachment,
+	}
+
+	pipeline_layout_info: vk.PipelineLayoutCreateInfo = {
+		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
+		setLayoutCount         = 0,
+		pushConstantRangeCount = 0,
+	}
+	vk_check(
+		vk.CreatePipelineLayout(r.device, &pipeline_layout_info, nil, &r.graphics_pipeline_layout),
+	)
+	defer if !ok do vk.DestroyPipelineLayout(r.device, r.graphics_pipeline_layout, nil)
+
+	pipeline_rendering_create_info: vk.PipelineRenderingCreateInfo = {
+		sType                   = .PIPELINE_RENDERING_CREATE_INFO,
+		colorAttachmentCount    = 1,
+		pColorAttachmentFormats = &r.swapchain.format,
+	}
+
+	pipeline_info: vk.GraphicsPipelineCreateInfo = {
+		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+		pNext               = &pipeline_rendering_create_info,
+		stageCount          = 2,
+		pStages             = raw_data(stages[:]),
+		pVertexInputState   = &vertex_input_info,
+		pInputAssemblyState = &input_assembly,
+		pViewportState      = &viewport_state,
+		pRasterizationState = &rasterizer,
+		pMultisampleState   = &multisampling,
+		pColorBlendState    = &color_blend_state,
+		pDynamicState       = &dynamic_state,
+		layout              = r.graphics_pipeline_layout,
+	}
+
+	vk_check(
+		vk.CreateGraphicsPipelines(r.device, {}, 1, &pipeline_info, nil, &r.graphics_pipeline),
+	)
+
+	return true
+}
+
+@(private)
+destroy_graphics_pipeline :: proc() {
+	vk.DestroyPipeline(r.device, r.graphics_pipeline, nil)
+	vk.DestroyPipelineLayout(r.device, r.graphics_pipeline_layout, nil)
+}
+
+@(private)
+create_command_pool :: proc() -> (ok: bool) {
+	pool_info: vk.CommandPoolCreateInfo = {
+		sType            = .COMMAND_POOL_CREATE_INFO,
+		flags            = {.RESET_COMMAND_BUFFER},
+		queueFamilyIndex = r.graphics_index,
+	}
+
+	vk_check(vk.CreateCommandPool(r.device, &pool_info, nil, &r.command_pool))
+
+	return true
+}
+
+@(private)
+destroy_command_pool :: proc() {
+	vk.DestroyCommandPool(r.device, r.command_pool, nil)
+}
+
+@(private)
+create_vertex_buffer :: proc() -> (ok: bool) {
+	buffer_info: vk.BufferCreateInfo = {
+		sType = .BUFFER_CREATE_INFO,
+		size  = vk.DeviceSize(
+			size_of(Vertex) * len(triangle_vertices) + size_of(u16) * len(triangle_indices),
+		),
+		usage = {.VERTEX_BUFFER, .INDEX_BUFFER},
+	}
+	vma_info: vma.Allocation_Create_Info = {
+		flags = {.Host_Access_Sequential_Write, .Host_Access_Allow_Transfer_Instead, .Mapped},
+		usage = .Auto,
+	}
+	log.debug("creating vma vertex buffer")
+	vk_check(
+		vma.create_buffer(
+			r.allocators.gpu,
+			buffer_info,
+			vma_info,
+			&r.vertex_buffer.buffer,
+			&r.vertex_buffer.allocation,
+			nil,
+		),
+	)
+	log.debug("vma vertex buffer created")
+
+	data: rawptr
+	vma.map_memory(r.allocators.gpu, r.vertex_buffer.allocation, &data)
+	defer vma.unmap_memory(r.allocators.gpu, r.vertex_buffer.allocation)
+	mem.copy(data, rawptr(&triangle_vertices[0]), size_of(Vertex) * len(triangle_vertices))
+	data = rawptr(mem.ptr_offset(cast(^byte)data, size_of(Vertex) * len(triangle_vertices)))
+	mem.copy(data, rawptr(&triangle_indices[0]), size_of(u16) * len(triangle_indices))
+
+	return true
+}
+
+@(private)
+destroy_vertex_buffer :: proc() {
+	vma.destroy_buffer(r.allocators.gpu, r.vertex_buffer.buffer, r.vertex_buffer.allocation)
+}
+
+@(private)
+create_command_buffers :: proc() -> (ok: bool) {
+	alloc_info: vk.CommandBufferAllocateInfo = {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = r.command_pool,
+		commandBufferCount = 1,
+		level              = .PRIMARY,
+	}
+
+	for &frame in r.frames {
+		vk_check(vk.AllocateCommandBuffers(r.device, &alloc_info, &frame.buffer))
+	}
+
+	return true
+}
+
+@(private)
+transition_swapchain_image_layout :: proc(
+	buf: vk.CommandBuffer,
+	image_index: int,
+	old_layout, new_layout: vk.ImageLayout,
+	src_access_mask, dst_access_mask: vk.AccessFlags2,
+	src_stage_mask, dst_stage_mask: vk.PipelineStageFlags2,
+) {
+	barrier: vk.ImageMemoryBarrier2 = {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = src_stage_mask,
+		srcAccessMask = src_access_mask,
+		dstStageMask = dst_stage_mask,
+		dstAccessMask = dst_access_mask,
+		oldLayout = old_layout,
+		newLayout = new_layout,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = r.swapchain.images[image_index],
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+
+	dependency_info: vk.DependencyInfo = {
+		sType                   = .DEPENDENCY_INFO,
+		dependencyFlags         = {},
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+
+	vk.CmdPipelineBarrier2(buf, &dependency_info)
+}
+
+@(private)
+record_command_buffer :: proc(image_index: int) {
+	buf := current_frame().buffer
+	vk.BeginCommandBuffer(buf, &vk.CommandBufferBeginInfo{sType = .COMMAND_BUFFER_BEGIN_INFO})
+
+	transition_swapchain_image_layout(
+		buf,
+		image_index,
+		.UNDEFINED,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		{},
+		{.COLOR_ATTACHMENT_WRITE},
+		{.COLOR_ATTACHMENT_OUTPUT},
+		{.COLOR_ATTACHMENT_OUTPUT},
+	)
+
+	clear_color: vk.ClearValue = {
+		color = {float32 = {0, 0, 0, 1}},
+	}
+	attachment_info: vk.RenderingAttachmentInfo = {
+		sType       = .RENDERING_ATTACHMENT_INFO,
+		clearValue  = clear_color,
+		imageView   = r.swapchain.views[image_index],
+		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		loadOp      = .CLEAR,
+		storeOp     = .STORE,
+	}
+
+	rendering_info: vk.RenderingInfo = {
+		sType = .RENDERING_INFO,
+		renderArea = {offset = {0, 0}, extent = r.swapchain.extent},
+		layerCount = 1,
+		colorAttachmentCount = 1,
+		pColorAttachments = &attachment_info,
+	}
+
+	vk.CmdBeginRendering(buf, &rendering_info)
+	vk.CmdBindPipeline(buf, .GRAPHICS, r.graphics_pipeline)
+	vk.CmdBindVertexBuffers(
+		buf,
+		0,
+		1,
+		&r.vertex_buffer.buffer,
+		raw_data([]vk.DeviceSize{vk.DeviceSize(0)}),
+	)
+	vk.CmdBindIndexBuffer(
+		buf,
+		r.vertex_buffer.buffer,
+		vk.DeviceSize(size_of(Vertex) * len(triangle_vertices)),
+		.UINT16,
+	)
+
+	viewport: vk.Viewport = {
+		width  = f32(r.swapchain.extent.width),
+		height = f32(r.swapchain.extent.height),
+	}
+	vk.CmdSetViewport(buf, 0, 1, &viewport)
+
+	scissor: vk.Rect2D = {
+		extent = r.swapchain.extent,
+		offset = {0, 0},
+	}
+	vk.CmdSetScissor(buf, 0, 1, &scissor)
+
+	vk.CmdDrawIndexed(buf, u32(len(triangle_indices)), 1, 0, 0, 0)
+	vk.CmdEndRendering(buf)
+
+	transition_swapchain_image_layout(
+		buf,
+		image_index,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		.PRESENT_SRC_KHR,
+		{.COLOR_ATTACHMENT_WRITE},
+		{},
+		{.COLOR_ATTACHMENT_OUTPUT},
+		{.BOTTOM_OF_PIPE},
+	)
+
+	vk_check(vk.EndCommandBuffer(buf))
+}
+
+@(private)
+create_sync_objects :: proc() -> (ok: bool) {
+	for &frame in r.frames {
+		vk_check(
+			vk.CreateSemaphore(
+				r.device,
+				&vk.SemaphoreCreateInfo{sType = .SEMAPHORE_CREATE_INFO},
+				nil,
+				&frame.semaphore,
+			),
+		)
+		vk_check(
+			vk.CreateFence(
+				r.device,
+				&vk.FenceCreateInfo{sType = .FENCE_CREATE_INFO, flags = {.SIGNALED}},
+				nil,
+				&frame.fence,
+			),
+		)
+	}
+
+	return true
+}
+
+@(private)
+destroy_sync_objects :: proc() {
+	for frame in r.frames {
+		vk.DestroyFence(r.device, frame.fence, nil)
+		vk.DestroySemaphore(r.device, frame.semaphore, nil)
+	}
+}
+
+init_renderer :: proc(
+	window_config: WindowConfig,
+	allocator := context.allocator,
+	temp_allocator := context.temp_allocator,
+	loc := #caller_location,
+) -> (
+	ok: bool,
+) {
+	log.debug("Initializing Vulkan renderer")
+	r = new(Renderer, allocator, loc)
+	defer if !ok do free(r, allocator)
+	r.allocators.cpu = allocator
+	r.allocators.temp = temp_allocator
+	r.ctx = context
+
+	init_window(window_config) or_return
+	defer if !ok do destroy_window()
+	log.debug("Window created")
+
+	create_instance() or_return
+	defer if !ok do destroy_instance()
+	log.debug("Instance created")
+
+	pick_physical_device() or_return
+	log.debug("Picked physical device")
+
+	create_logical_device() or_return
+	defer if !ok do destroy_logical_device()
+	log.debug("Created device")
+
+	create_vma() or_return
+	defer if !ok do destroy_vma()
+	log.debug("Setup VMA")
+
+	create_swapchain() or_return
+	defer if !ok do destroy_swapchain()
+	log.debug("Created swapchain")
+
+	create_swapchain_data() or_return
+	defer if !ok do destroy_swapchain_data()
+	log.debug("Created swapchain image views")
+
+	create_graphics_pipeline() or_return
+	defer if !ok do destroy_graphics_pipeline()
+	log.debug("Graphics pipeline created")
+
+	create_command_pool() or_return
+	defer if !ok do destroy_command_pool()
+	log.debug("Command pool created")
+
+	create_vertex_buffer() or_return
+	defer if !ok do destroy_vertex_buffer()
+	log.debug("Vertex buffer created")
+
+	create_command_buffers() or_return
+	log.debug("Command buffer created")
+
+	create_sync_objects() or_return
+	defer if !ok do destroy_sync_objects()
+	log.debug("Created sync objects")
+
+	log.info("Vulkan renderer initialized")
+	return true
+}
+
+destroy_renderer :: proc() {
+	vk.DeviceWaitIdle(r.device)
+	destroy_sync_objects()
+	destroy_vertex_buffer()
+	destroy_command_pool()
+	destroy_graphics_pipeline()
+	destroy_swapchain_data()
+	destroy_swapchain()
+	destroy_vma()
+	destroy_logical_device()
+	destroy_instance()
+	destroy_window()
+	free(r, r.allocators.cpu)
+}
+
+draw_frame :: proc() {
+	if r.resize_requested {
+		recreate_swapchain()
+		r.resize_requested = false
+	}
+
+	frame := current_frame()
+
+	vk_check(vk.WaitForFences(r.device, 1, &frame.fence, true, max(u64)))
+
+	image_index: u32
+	res := vk.AcquireNextImageKHR(
+		r.device,
+		r.swapchain.handle,
+		max(u64),
+		frame.semaphore,
+		{},
+		&image_index,
+	)
+	#partial switch res {
+	case .ERROR_OUT_OF_DATE_KHR:
+		r.resize_requested = true
+		return
+	case .SUBOPTIMAL_KHR:
+		r.resize_requested = true
+	case:
+		vk_check(res)
+	}
+
+	record_command_buffer(int(image_index))
+	vk.ResetFences(r.device, 1, &frame.fence)
+
+	wait_stage_dest_mask: vk.PipelineStageFlags = {.COLOR_ATTACHMENT_OUTPUT}
+	submit_info: vk.SubmitInfo = {
+		sType                = .SUBMIT_INFO,
+		waitSemaphoreCount   = 1,
+		pWaitSemaphores      = &frame.semaphore,
+		pWaitDstStageMask    = &wait_stage_dest_mask,
+		commandBufferCount   = 1,
+		pCommandBuffers      = &frame.buffer,
+		signalSemaphoreCount = 1,
+		pSignalSemaphores    = &r.swapchain.semaphores[image_index],
+	}
+
+	vk_check(vk.QueueSubmit(r.graphics_queue, 1, &submit_info, frame.fence))
+
+	present_info: vk.PresentInfoKHR = {
+		sType              = .PRESENT_INFO_KHR,
+		waitSemaphoreCount = 1,
+		pWaitSemaphores    = &r.swapchain.semaphores[image_index],
+		swapchainCount     = 1,
+		pSwapchains        = &r.swapchain.handle,
+		pImageIndices      = &image_index,
+	}
+
+	res = vk.QueuePresentKHR(r.present_queue, &present_info)
+	#partial switch res {
+	case .SUBOPTIMAL_KHR, .ERROR_OUT_OF_DATE_KHR:
+		r.resize_requested = true
+	case:
+		vk_check(res)
+	}
+	r.frame_index += 1
+}
+
+
+main :: proc() {
+	log_level: log.Level = .Info
+	log_opts: log.Options = {.Level, .Line, .Terminal_Color}
+	log_ident := "Dial"
+
+	when ODIN_DEBUG {
+		log_level = .Debug
+		log_opts |= {.Date, .Time}
+
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+
+		defer {
+			if len(track.allocation_map) > 0 {
+				log.errorf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					log.errorf("- %v bytes @ %v\n", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				log.errorf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					log.errorf("- %p @ %v\n", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
+
+	context.logger = log.create_console_logger(log_level, log_opts, log_ident)
+
+	if !init_renderer({window_title = "test window", app_id = "com.boondax.dial", width = WIDTH, height = HEIGHT, window_flags = {.VULKAN, .RESIZABLE}}, context.allocator) do return
+	defer destroy_renderer()
+
+	render_loop: for {
+		e: sdl.Event
+		event_loop: for sdl.PollEvent(&e) {
+			#partial switch e.type {
+			case .QUIT:
+				break render_loop
+			case .KEY_UP:
+				#partial switch e.key.scancode {
+				case .ESCAPE:
+					break render_loop
+				}
+			case .WINDOW_RESIZED:
+				request_resize()
+			}
+		}
+
+		draw_frame()
+	}
+}
