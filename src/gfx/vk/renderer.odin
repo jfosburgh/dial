@@ -2,8 +2,10 @@ package gfx
 
 import "base:runtime"
 import "core:log"
+import glm "core:math/linalg"
 import "core:mem"
 import "core:slice"
+import "core:time"
 
 import "shared:vma"
 import sdl "vendor:sdl3"
@@ -40,9 +42,12 @@ Swapchain :: struct {
 }
 
 FrameData :: struct {
-	buffer:    vk.CommandBuffer,
-	semaphore: vk.Semaphore,
-	fence:     vk.Fence,
+	buffer:                vk.CommandBuffer,
+	semaphore:             vk.Semaphore,
+	fence:                 vk.Fence,
+	uniform_buffer:        AllocatedBuffer,
+	descriptor_set_layout: vk.DescriptorSetLayout,
+	descriptor_set:        vk.DescriptorSet,
 }
 
 Renderer :: struct {
@@ -58,12 +63,15 @@ Renderer :: struct {
 	present_queue:                 vk.Queue,
 	graphics_index, present_index: u32,
 	swapchain:                     Swapchain,
+	descriptor_set_layout:         vk.DescriptorSetLayout,
+	descriptor_pool:               vk.DescriptorPool,
 	graphics_pipeline:             vk.Pipeline,
 	graphics_pipeline_layout:      vk.PipelineLayout,
 	command_pool:                  vk.CommandPool,
 	frames:                        [FRAMES_IN_FLIGHT]FrameData,
 	frame_index:                   uint,
 	resize_requested:              bool,
+	start_time:                    time.Time,
 	vertex_buffer:                 AllocatedBuffer,
 }
 
@@ -106,6 +114,10 @@ triangle_vertices: []Vertex = {
 }
 
 triangle_indices: []u16 = {0, 1, 2, 2, 3, 0}
+
+UBO :: struct {
+	model, view, proj: matrix[4, 4]f32,
+}
 
 vk_check :: proc(res: vk.Result, loc := #caller_location) {
 	#partial switch res {
@@ -779,8 +791,33 @@ create_shader_module :: proc(code: []byte) -> (shader: vk.ShaderModule) {
 }
 
 @(private)
+create_descriptor_set_layout :: proc() -> (ok: bool) {
+	ubo_layout_binding: vk.DescriptorSetLayoutBinding = {
+		binding         = 0,
+		descriptorType  = .UNIFORM_BUFFER,
+		descriptorCount = 1,
+		stageFlags      = {.VERTEX},
+	}
+
+	layout_info: vk.DescriptorSetLayoutCreateInfo = {
+		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings    = &ubo_layout_binding,
+	}
+
+	vk_check(vk.CreateDescriptorSetLayout(r.device, &layout_info, nil, &r.descriptor_set_layout))
+
+	return true
+}
+
+@(private)
+destroy_descriptor_set_layout :: proc() {
+	vk.DestroyDescriptorSetLayout(r.device, r.descriptor_set_layout, nil)
+}
+
+@(private)
 create_graphics_pipeline :: proc() -> (ok: bool) {
-	shader_code := #load("./default_shaders/buffer_triangle.spv")
+	shader_code := #load("./default_shaders/ubo.spv")
 	shader_module := create_shader_module(shader_code)
 	defer vk.DestroyShaderModule(r.device, shader_module, nil)
 
@@ -833,7 +870,7 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		depthClampEnable        = false,
 		rasterizerDiscardEnable = false,
 		polygonMode             = .FILL,
-		cullMode                = {.BACK},
+		cullMode                = {},
 		frontFace               = .CLOCKWISE,
 		depthBiasEnable         = false,
 		depthBiasSlopeFactor    = 1,
@@ -861,7 +898,8 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 
 	pipeline_layout_info: vk.PipelineLayoutCreateInfo = {
 		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
-		setLayoutCount         = 0,
+		setLayoutCount         = 1,
+		pSetLayouts            = &r.descriptor_set_layout,
 		pushConstantRangeCount = 0,
 	}
 	vk_check(
@@ -963,6 +1001,119 @@ destroy_vertex_buffer :: proc() {
 }
 
 @(private)
+create_uniform_buffers :: proc() -> (ok: bool) {
+	buffer_info: vk.BufferCreateInfo = {
+		sType = .BUFFER_CREATE_INFO,
+		size  = vk.DeviceSize(size_of(UBO)),
+		usage = {.UNIFORM_BUFFER},
+	}
+	vma_info: vma.Allocation_Create_Info = {
+		flags = {.Host_Access_Sequential_Write, .Host_Access_Allow_Transfer_Instead, .Mapped},
+		usage = .Auto,
+	}
+
+	for &frame in r.frames {
+		vk_check(
+			vma.create_buffer(
+				r.allocators.gpu,
+				buffer_info,
+				vma_info,
+				&frame.uniform_buffer.buffer,
+				&frame.uniform_buffer.allocation,
+				nil,
+			),
+		)
+	}
+
+	return true
+}
+
+@(private)
+destroy_uniform_buffers :: proc() {
+	for frame in r.frames {
+		vma.destroy_buffer(
+			r.allocators.gpu,
+			frame.uniform_buffer.buffer,
+			frame.uniform_buffer.allocation,
+		)
+	}
+}
+
+@(private)
+create_descriptor_pool :: proc() -> (ok: bool) {
+	pool_size: vk.DescriptorPoolSize = {
+		descriptorCount = FRAMES_IN_FLIGHT,
+		type            = .UNIFORM_BUFFER,
+	}
+
+	pool_info: vk.DescriptorPoolCreateInfo = {
+		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
+		flags         = {.FREE_DESCRIPTOR_SET},
+		maxSets       = FRAMES_IN_FLIGHT,
+		poolSizeCount = 1,
+		pPoolSizes    = &pool_size,
+	}
+
+	vk_check(vk.CreateDescriptorPool(r.device, &pool_info, nil, &r.descriptor_pool))
+
+	return true
+}
+
+@(private)
+destroy_descriptor_pool :: proc() {
+	vk.DestroyDescriptorPool(r.device, r.descriptor_pool, nil)
+}
+
+@(private)
+create_descriptor_sets :: proc() -> (ok: bool) {
+	layouts := make([]vk.DescriptorSetLayout, FRAMES_IN_FLIGHT, r.allocators.cpu)
+	for i in 0 ..< FRAMES_IN_FLIGHT do layouts[i] = r.descriptor_set_layout
+	defer delete(layouts)
+	alloc_info: vk.DescriptorSetAllocateInfo = {
+		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool     = r.descriptor_pool,
+		descriptorSetCount = FRAMES_IN_FLIGHT,
+		pSetLayouts        = raw_data(layouts),
+	}
+
+	descriptor_sets := make([]vk.DescriptorSet, FRAMES_IN_FLIGHT, r.allocators.cpu)
+	vk_check(vk.AllocateDescriptorSets(r.device, &alloc_info, raw_data(descriptor_sets)))
+	defer delete(descriptor_sets)
+
+	for &frame, i in r.frames {
+		buffer_info: vk.DescriptorBufferInfo = {
+			buffer = frame.uniform_buffer.buffer,
+			offset = 0,
+			range  = size_of(UBO),
+		}
+
+		frame.descriptor_set_layout = layouts[i]
+		frame.descriptor_set = descriptor_sets[i]
+
+		descriptor_write: vk.WriteDescriptorSet = {
+			sType           = .WRITE_DESCRIPTOR_SET,
+			dstSet          = frame.descriptor_set,
+			dstBinding      = 0,
+			dstArrayElement = 0,
+			descriptorCount = 1,
+			descriptorType  = .UNIFORM_BUFFER,
+			pBufferInfo     = &buffer_info,
+		}
+
+		vk.UpdateDescriptorSets(r.device, 1, &descriptor_write, 0, nil)
+	}
+
+	return true
+}
+
+@(private)
+destroy_descriptor_sets :: proc() {
+	// for frame in r.frames {
+	// 	vk.DestroyDescriptorSetLayout(r.device, frame.descriptor_set_layout, nil)
+	// }
+}
+
+@(private)
 create_command_buffers :: proc() -> (ok: bool) {
 	alloc_info: vk.CommandBufferAllocateInfo = {
 		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1018,7 +1169,8 @@ transition_swapchain_image_layout :: proc(
 
 @(private)
 record_command_buffer :: proc(image_index: int) {
-	buf := current_frame().buffer
+	frame := current_frame()
+	buf := frame.buffer
 	vk.BeginCommandBuffer(buf, &vk.CommandBufferBeginInfo{sType = .COMMAND_BUFFER_BEGIN_INFO})
 
 	transition_swapchain_image_layout(
@@ -1080,6 +1232,16 @@ record_command_buffer :: proc(image_index: int) {
 	}
 	vk.CmdSetScissor(buf, 0, 1, &scissor)
 
+	vk.CmdBindDescriptorSets(
+		buf,
+		.GRAPHICS,
+		r.graphics_pipeline_layout,
+		0,
+		1,
+		&frame.descriptor_set,
+		0,
+		nil,
+	)
 	vk.CmdDrawIndexed(buf, u32(len(triangle_indices)), 1, 0, 0, 0)
 	vk.CmdEndRendering(buf)
 
@@ -1171,6 +1333,10 @@ init_renderer :: proc(
 	defer if !ok do destroy_swapchain_data()
 	log.debug("Created swapchain image views")
 
+	create_descriptor_set_layout() or_return
+	defer if !ok do destroy_descriptor_set_layout()
+	log.debug("Created descriptor set layout")
+
 	create_graphics_pipeline() or_return
 	defer if !ok do destroy_graphics_pipeline()
 	log.debug("Graphics pipeline created")
@@ -1183,12 +1349,26 @@ init_renderer :: proc(
 	defer if !ok do destroy_vertex_buffer()
 	log.debug("Vertex buffer created")
 
+	create_uniform_buffers() or_return
+	defer if !ok do destroy_uniform_buffers()
+	log.debug("Uniform buffers created")
+
+	create_descriptor_pool() or_return
+	defer if !ok do destroy_descriptor_pool()
+	log.debug("Descriptor pool created")
+
+	create_descriptor_sets() or_return
+	defer if !ok do destroy_descriptor_sets()
+	log.debug("Descriptor sets created")
+
 	create_command_buffers() or_return
 	log.debug("Command buffer created")
 
 	create_sync_objects() or_return
 	defer if !ok do destroy_sync_objects()
 	log.debug("Created sync objects")
+
+	r.start_time = time.now()
 
 	log.info("Vulkan renderer initialized")
 	return true
@@ -1197,9 +1377,13 @@ init_renderer :: proc(
 destroy_renderer :: proc() {
 	vk.DeviceWaitIdle(r.device)
 	destroy_sync_objects()
+	destroy_descriptor_sets()
+	destroy_descriptor_pool()
+	destroy_uniform_buffers()
 	destroy_vertex_buffer()
 	destroy_command_pool()
 	destroy_graphics_pipeline()
+	destroy_descriptor_set_layout()
 	destroy_swapchain_data()
 	destroy_swapchain()
 	destroy_vma()
@@ -1207,6 +1391,28 @@ destroy_renderer :: proc() {
 	destroy_instance()
 	destroy_window()
 	free(r, r.allocators.cpu)
+}
+
+@(private)
+update_uniform_buffer :: proc() {
+	ubo := UBO{}
+	elapsed := time.duration_seconds(time.since(r.start_time))
+
+	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(90)) * f32(elapsed), {0, 0, 1})
+	ubo.view = glm.matrix4_look_at_f32({2, 2, 2}, {0, 0, 0}, {0, 0, 1})
+	ubo.proj = glm.matrix4_perspective_f32(
+		glm.to_radians(f32(45)),
+		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
+		0.1,
+		10,
+	)
+	ubo.proj[1][1] *= -1
+
+	data: rawptr
+	vma.map_memory(r.allocators.gpu, current_frame().uniform_buffer.allocation, &data)
+	defer vma.unmap_memory(r.allocators.gpu, current_frame().uniform_buffer.allocation)
+
+	mem.copy(data, rawptr(&ubo), size_of(UBO))
 }
 
 draw_frame :: proc() {
@@ -1240,6 +1446,8 @@ draw_frame :: proc() {
 
 	record_command_buffer(int(image_index))
 	vk.ResetFences(r.device, 1, &frame.fence)
+
+	update_uniform_buffer()
 
 	wait_stage_dest_mask: vk.PipelineStageFlags = {.COLOR_ATTACHMENT_OUTPUT}
 	submit_info: vk.SubmitInfo = {
