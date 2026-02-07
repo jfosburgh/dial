@@ -2,6 +2,7 @@ package gfx
 
 import "base:runtime"
 import "core:log"
+import "core:math"
 import glm "core:math/linalg"
 import "core:mem"
 import "core:slice"
@@ -18,7 +19,7 @@ HEIGHT :: 720
 FRAMES_IN_FLIGHT :: 2
 
 TEXTURE_IMAGE :: "assets/images/texture.jpg"
-DEFAULT_SHADER :: "./default_shaders/textured_quad.spv"
+DEFAULT_SHADER :: "./default_shaders/depth_quads.spv"
 
 ENABLE_DEBUG_MESSENGER :: true
 
@@ -78,6 +79,8 @@ Renderer :: struct {
 	start_time:                    time.Time,
 	vertex_buffer:                 AllocatedBuffer,
 	texture_image:                 AllocatedImage,
+	depth_image:                   AllocatedImage,
+	depth_format:                  vk.Format,
 }
 
 r: ^Renderer
@@ -95,7 +98,7 @@ AllocatedImage :: struct {
 }
 
 Vertex :: struct {
-	pos:   [2]f32,
+	pos:   [3]f32,
 	color: [3]f32,
 	tex:   [2]f32,
 }
@@ -109,7 +112,12 @@ get_vertex_attribute_descriptions :: proc(
 	attributes: [3]vk.VertexInputAttributeDescription,
 ) {
 	return {
-		{binding = 0, location = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
+		{
+			binding = 0,
+			location = 0,
+			format = .R32G32B32_SFLOAT,
+			offset = u32(offset_of(Vertex, pos)),
+		},
 		{
 			binding = 0,
 			location = 1,
@@ -121,13 +129,17 @@ get_vertex_attribute_descriptions :: proc(
 }
 
 triangle_vertices: []Vertex = {
-	{{-0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
-	{{0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
-	{{0.5, 0.5}, {0.0, 0.0, 1.0}, {0, 1}},
-	{{-0.5, 0.5}, {1.0, 1.0, 1.0}, {1, 1}},
+	{{-0.5, -0.5, 0}, {1.0, 0.0, 0.0}, {1, 0}},
+	{{0.5, -0.5, 0}, {0.0, 1.0, 0.0}, {0, 0}},
+	{{0.5, 0.5, 0}, {0.0, 0.0, 1.0}, {0, 1}},
+	{{-0.5, 0.5, 0}, {1.0, 1.0, 1.0}, {1, 1}},
+	{{-0.5, -0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
+	{{0.5, -0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
+	{{0.5, 0.5, -0.5}, {0.0, 0.0, 1.0}, {0, 1}},
+	{{-0.5, 0.5, -0.5}, {1.0, 1.0, 1.0}, {1, 1}},
 }
 
-triangle_indices: []u16 = {0, 1, 2, 2, 3, 0}
+triangle_indices: []u16 = {0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4}
 
 UBO :: struct {
 	model, view, proj: matrix[4, 4]f32,
@@ -792,9 +804,11 @@ recreate_swapchain :: proc() {
 
 	destroy_swapchain_data()
 	destroy_swapchain()
+	destroy_depth_resources()
 
 	create_swapchain()
 	create_swapchain_data()
+	create_depth_resources()
 }
 
 @(private)
@@ -923,6 +937,15 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		pAttachments    = &color_blend_attachment,
 	}
 
+	depth_stencil: vk.PipelineDepthStencilStateCreateInfo = {
+		sType                 = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		depthTestEnable       = true,
+		depthWriteEnable      = true,
+		depthCompareOp        = .LESS,
+		depthBoundsTestEnable = false,
+		stencilTestEnable     = false,
+	}
+
 	pipeline_layout_info: vk.PipelineLayoutCreateInfo = {
 		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
 		setLayoutCount         = 1,
@@ -938,6 +961,7 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		sType                   = .PIPELINE_RENDERING_CREATE_INFO,
 		colorAttachmentCount    = 1,
 		pColorAttachmentFormats = &r.swapchain.format,
+		depthAttachmentFormat   = r.depth_format,
 	}
 
 	pipeline_info: vk.GraphicsPipelineCreateInfo = {
@@ -953,6 +977,7 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		pColorBlendState    = &color_blend_state,
 		pDynamicState       = &dynamic_state,
 		layout              = r.graphics_pipeline_layout,
+		pDepthStencilState  = &depth_stencil,
 	}
 
 	vk_check(
@@ -987,6 +1012,113 @@ destroy_command_pool :: proc() {
 }
 
 @(private)
+find_supported_formats :: proc(
+	candidates: []vk.Format,
+	tiling: vk.ImageTiling,
+	features: vk.FormatFeatureFlags,
+) -> vk.Format {
+	for format in candidates {
+		props: vk.FormatProperties
+		vk.GetPhysicalDeviceFormatProperties(r.physical_device, format, &props)
+
+		if tiling == .LINEAR && props.linearTilingFeatures & features == features do return format
+		if tiling == .OPTIMAL && props.optimalTilingFeatures & features == features do return format
+	}
+
+	unreachable()
+}
+
+@(private)
+find_depth_format :: proc() -> vk.Format {
+	return find_supported_formats(
+		{.D32_SFLOAT, .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT},
+		.OPTIMAL,
+		{.DEPTH_STENCIL_ATTACHMENT},
+	)
+}
+
+@(private)
+has_stencil_component :: proc(format: vk.Format) -> bool {
+	return format == .D32_SFLOAT_S8_UINT || format == .D24_UNORM_S8_UINT
+}
+
+@(private)
+create_depth_resources :: proc() -> (ok: bool) {
+	r.depth_format = find_depth_format()
+	create_image(
+		&r.depth_image,
+		r.swapchain.extent.width,
+		r.swapchain.extent.height,
+		r.depth_format,
+		{.DEPTH_STENCIL_ATTACHMENT},
+		1,
+	)
+
+	return true
+}
+
+@(private)
+destroy_depth_resources :: proc() {
+	vk.DestroyImageView(r.device, r.depth_image.view, nil)
+	vma.destroy_image(r.allocators.gpu, r.depth_image.image, r.depth_image.allocation)
+}
+
+@(private)
+create_image :: proc(
+	image: ^AllocatedImage,
+	width, height: u32,
+	format: vk.Format,
+	usage: vk.ImageUsageFlags,
+	mip_levels: u32 = 1,
+) {
+	image_info: vk.ImageCreateInfo = {
+		sType = .IMAGE_CREATE_INFO,
+		imageType = .D2,
+		format = format,
+		extent = {width = width, height = height, depth = 1},
+		mipLevels = mip_levels,
+		arrayLayers = 1,
+		samples = {._1},
+		tiling = .OPTIMAL,
+		usage = usage,
+		initialLayout = .UNDEFINED,
+	}
+	alloc_info: vma.Allocation_Create_Info = {
+		usage = .Auto,
+	}
+	vk_check(
+		vma.create_image(
+			r.allocators.gpu,
+			image_info,
+			alloc_info,
+			&image.image,
+			&image.allocation,
+			nil,
+		),
+	)
+
+	aspect: vk.ImageAspectFlags = {.COLOR}
+	#partial switch format {
+	case .D32_SFLOAT, .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT:
+		aspect = {.DEPTH}
+	}
+	view_info: vk.ImageViewCreateInfo = {
+		sType = .IMAGE_VIEW_CREATE_INFO,
+		image = image.image,
+		viewType = .D2,
+		format = format,
+		subresourceRange = {
+			aspectMask = aspect,
+			layerCount = 1,
+			baseArrayLayer = 0,
+			levelCount = 1,
+			baseMipLevel = 0,
+		},
+	}
+	vk_check(vk.CreateImageView(r.device, &view_info, nil, &image.view))
+}
+
+@(private)
 create_texture_image :: proc() -> (ok: bool) {
 	width, height, channels: i32
 	data := stbi.load(TEXTURE_IMAGE, &width, &height, &channels, 4)
@@ -998,46 +1130,13 @@ create_texture_image :: proc() -> (ok: bool) {
 	}
 	defer stbi.image_free(data)
 
-	image_info: vk.ImageCreateInfo = {
-		sType = .IMAGE_CREATE_INFO,
-		imageType = .D2,
-		format = .R8G8B8A8_SRGB,
-		extent = {width = u32(width), height = u32(height), depth = 1},
-		mipLevels = 1,
-		arrayLayers = 1,
-		samples = {._1},
-		tiling = .OPTIMAL,
-		usage = {.TRANSFER_DST, .SAMPLED},
-		initialLayout = .UNDEFINED,
-	}
-	alloc_info: vma.Allocation_Create_Info = {
-		usage = .Auto,
-	}
-	vk_check(
-		vma.create_image(
-			r.allocators.gpu,
-			image_info,
-			alloc_info,
-			&r.texture_image.image,
-			&r.texture_image.allocation,
-			nil,
-		),
+	create_image(
+		&r.texture_image,
+		u32(width),
+		u32(height),
+		.R8G8B8A8_SRGB,
+		{.TRANSFER_DST, .SAMPLED},
 	)
-
-	view_info: vk.ImageViewCreateInfo = {
-		sType = .IMAGE_VIEW_CREATE_INFO,
-		image = r.texture_image.image,
-		viewType = .D2,
-		format = .R8G8B8A8_SRGB,
-		subresourceRange = {
-			aspectMask = {.COLOR},
-			layerCount = 1,
-			baseArrayLayer = 0,
-			levelCount = 1,
-			baseMipLevel = 0,
-		},
-	}
-	vk_check(vk.CreateImageView(r.device, &view_info, nil, &r.texture_image.view))
 
 	img_buf: vk.Buffer
 	img_alloc: vma.Allocation
@@ -1372,6 +1471,7 @@ transition_image :: proc(
 	old_layout, new_layout: vk.ImageLayout,
 	src_access_mask, dst_access_mask: vk.AccessFlags2,
 	src_stage_mask, dst_stage_mask: vk.PipelineStageFlags2,
+	aspect_mask: vk.ImageAspectFlags = {.COLOR},
 ) {
 	barrier: vk.ImageMemoryBarrier2 = {
 		sType = .IMAGE_MEMORY_BARRIER_2,
@@ -1385,7 +1485,7 @@ transition_image :: proc(
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		image = image,
 		subresourceRange = {
-			aspectMask = {.COLOR},
+			aspectMask = aspect_mask,
 			baseMipLevel = 0,
 			levelCount = 1,
 			baseArrayLayer = 0,
@@ -1440,10 +1540,29 @@ record_command_buffer :: proc(image_index: int) {
 		{.COLOR_ATTACHMENT_OUTPUT},
 	)
 
+	depth_aspect: vk.ImageAspectFlags = {.DEPTH}
+	if has_stencil_component(r.depth_format) {
+		depth_aspect |= {.STENCIL}
+	}
+	transition_image(
+		buf,
+		r.depth_image.image,
+		.UNDEFINED,
+		.DEPTH_ATTACHMENT_OPTIMAL,
+		{.DEPTH_STENCIL_ATTACHMENT_WRITE},
+		{.DEPTH_STENCIL_ATTACHMENT_WRITE},
+		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS},
+		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS},
+		depth_aspect,
+	)
+
 	clear_color: vk.ClearValue = {
 		color = {float32 = {0, 0, 0, 1}},
 	}
-	attachment_info: vk.RenderingAttachmentInfo = {
+	clear_depth: vk.ClearValue = {
+		depthStencil = {depth = 1, stencil = 0},
+	}
+	color_attachment_info: vk.RenderingAttachmentInfo = {
 		sType       = .RENDERING_ATTACHMENT_INFO,
 		clearValue  = clear_color,
 		imageView   = r.swapchain.views[image_index],
@@ -1451,13 +1570,22 @@ record_command_buffer :: proc(image_index: int) {
 		loadOp      = .CLEAR,
 		storeOp     = .STORE,
 	}
+	depth_attachment_info: vk.RenderingAttachmentInfo = {
+		sType       = .RENDERING_ATTACHMENT_INFO,
+		clearValue  = clear_depth,
+		imageView   = r.depth_image.view,
+		imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
+		loadOp      = .CLEAR,
+		storeOp     = .DONT_CARE,
+	}
 
 	rendering_info: vk.RenderingInfo = {
 		sType = .RENDERING_INFO,
 		renderArea = {offset = {0, 0}, extent = r.swapchain.extent},
 		layerCount = 1,
 		colorAttachmentCount = 1,
-		pColorAttachments = &attachment_info,
+		pColorAttachments = &color_attachment_info,
+		pDepthAttachment = &depth_attachment_info,
 	}
 
 	vk.CmdBeginRendering(buf, &rendering_info)
@@ -1593,13 +1721,17 @@ init_renderer :: proc(
 	defer if !ok do destroy_descriptor_set_layout()
 	log.debug("Created descriptor set layout")
 
-	create_graphics_pipeline() or_return
-	defer if !ok do destroy_graphics_pipeline()
-	log.debug("Graphics pipeline created")
-
 	create_command_pool() or_return
 	defer if !ok do destroy_command_pool()
 	log.debug("Command pool created")
+
+	create_depth_resources() or_return
+	defer if !ok do destroy_depth_resources()
+	log.debug("Depth resources created")
+
+	create_graphics_pipeline() or_return
+	defer if !ok do destroy_graphics_pipeline()
+	log.debug("Graphics pipeline created")
 
 	create_texture_image() or_return
 	defer if !ok do destroy_texture_image()
@@ -1642,6 +1774,7 @@ destroy_renderer :: proc() {
 	destroy_uniform_buffers()
 	destroy_vertex_buffer()
 	destroy_texture_image()
+	destroy_depth_resources()
 	destroy_command_pool()
 	destroy_graphics_pipeline()
 	destroy_descriptor_set_layout()
@@ -1654,6 +1787,26 @@ destroy_renderer :: proc() {
 	free(r, r.allocators.cpu)
 }
 
+@(require_results)
+matrix4_perspective_z0_f32 :: proc "contextless" (
+	fovy, aspect, near, far: f32,
+) -> (
+	m: glm.Matrix4f32,
+) #no_bounds_check {
+	tan_half_fovy := math.tan(0.5 * fovy)
+	m[0, 0] = 1 / (aspect * tan_half_fovy)
+	m[1, 1] = 1 / (tan_half_fovy)
+	m[3, 2] = +1
+
+	m[2, 2] = far / (far - near)
+	m[2, 3] = -(far * near) / (far - near)
+
+	m[2] = -m[2]
+	m[1, 1] *= -1
+
+	return
+}
+
 @(private)
 update_uniform_buffer :: proc() {
 	ubo := UBO{}
@@ -1661,13 +1814,12 @@ update_uniform_buffer :: proc() {
 
 	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(90)) * f32(elapsed), {0, 0, 1})
 	ubo.view = glm.matrix4_look_at_f32({2, 2, 2}, {0, 0, 0}, {0, 0, 1})
-	ubo.proj = glm.matrix4_perspective_f32(
+	ubo.proj = matrix4_perspective_z0_f32(
 		glm.to_radians(f32(45)),
 		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
 		0.1,
 		10,
 	)
-	ubo.proj[1][1] *= -1
 
 	data: rawptr
 	vma.map_memory(r.allocators.gpu, current_frame().uniform_buffer.allocation, &data)

@@ -2,3 +2,4 @@ slangc src/gfx/vk/default_shaders/triangle.slang -target spirv -profile spirv_1_
 slangc src/gfx/vk/default_shaders/buffer_triangle.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/buffer_triangle.spv
 slangc src/gfx/vk/default_shaders/ubo_quad.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/ubo_quad.spv
 slangc src/gfx/vk/default_shaders/textured_quad.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/textured_quad.spv
+slangc src/gfx/vk/default_shaders/depth_quads.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o src/gfx/vk/default_shaders/depth_quads.spv
