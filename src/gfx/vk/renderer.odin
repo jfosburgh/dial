@@ -9,12 +9,16 @@ import "core:time"
 
 import "shared:vma"
 import sdl "vendor:sdl3"
+import stbi "vendor:stb/image"
 import vk "vendor:vulkan"
 
 WIDTH :: 1280
 HEIGHT :: 720
 
 FRAMES_IN_FLIGHT :: 2
+
+TEXTURE_IMAGE :: "assets/images/texture.jpg"
+DEFAULT_SHADER :: "./default_shaders/textured_quad.spv"
 
 ENABLE_DEBUG_MESSENGER :: true
 
@@ -73,6 +77,7 @@ Renderer :: struct {
 	resize_requested:              bool,
 	start_time:                    time.Time,
 	vertex_buffer:                 AllocatedBuffer,
+	texture_image:                 AllocatedImage,
 }
 
 r: ^Renderer
@@ -82,9 +87,17 @@ AllocatedBuffer :: struct {
 	allocation: vma.Allocation,
 }
 
+AllocatedImage :: struct {
+	image:      vk.Image,
+	view:       vk.ImageView,
+	allocation: vma.Allocation,
+	sampler:    vk.Sampler,
+}
+
 Vertex :: struct {
 	pos:   [2]f32,
 	color: [3]f32,
+	tex:   [2]f32,
 }
 
 get_vertex_binding_description :: proc() -> vk.VertexInputBindingDescription {
@@ -93,7 +106,7 @@ get_vertex_binding_description :: proc() -> vk.VertexInputBindingDescription {
 
 get_vertex_attribute_descriptions :: proc(
 ) -> (
-	attributes: [2]vk.VertexInputAttributeDescription,
+	attributes: [3]vk.VertexInputAttributeDescription,
 ) {
 	return {
 		{binding = 0, location = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
@@ -103,14 +116,15 @@ get_vertex_attribute_descriptions :: proc(
 			format = .R32G32B32_SFLOAT,
 			offset = u32(offset_of(Vertex, color)),
 		},
+		{binding = 0, location = 2, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, tex))},
 	}
 }
 
 triangle_vertices: []Vertex = {
-	{{-0.5, -0.5}, {1.0, 0.0, 0.0}},
-	{{0.5, -0.5}, {0.0, 1.0, 0.0}},
-	{{0.5, 0.5}, {0.0, 0.0, 1.0}},
-	{{-0.5, 0.5}, {1.0, 1.0, 1.0}},
+	{{-0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
+	{{0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
+	{{0.5, 0.5}, {0.0, 0.0, 1.0}, {0, 1}},
+	{{-0.5, 0.5}, {1.0, 1.0, 1.0}, {1, 1}},
 }
 
 triangle_indices: []u16 = {0, 1, 2, 2, 3, 0}
@@ -419,11 +433,15 @@ find_queue_families :: proc(
 score_physical_device :: proc(device: vk.PhysicalDevice) -> (score: int) {
 	properties: vk.PhysicalDeviceProperties
 	vk.GetPhysicalDeviceProperties(device, &properties)
+	device_name := cstring(raw_data(properties.deviceName[:]))
 
 	features: vk.PhysicalDeviceFeatures
 	vk.GetPhysicalDeviceFeatures(device, &features)
 
-	device_name := cstring(raw_data(properties.deviceName[:]))
+	if !features.samplerAnisotropy {
+		log.debugf("device %s does not support sampler anisotropy: %s", device_name)
+		return 0
+	}
 
 	device_ext_count: u32
 	if vk.EnumerateDeviceExtensionProperties(device, nil, &device_ext_count, nil) != .SUCCESS do return 0
@@ -525,7 +543,9 @@ create_logical_device :: proc() -> (ok: bool) {
 		pQueuePriorities = &priority,
 	}
 
-	device_features: vk.PhysicalDeviceFeatures = {}
+	device_features: vk.PhysicalDeviceFeatures = {
+		samplerAnisotropy = true,
+	}
 
 	extended_dynamic_features: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT = {
 		sType                = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
@@ -798,11 +818,18 @@ create_descriptor_set_layout :: proc() -> (ok: bool) {
 		descriptorCount = 1,
 		stageFlags      = {.VERTEX},
 	}
+	image_sampler_binding: vk.DescriptorSetLayoutBinding = {
+		binding         = 1,
+		descriptorType  = .COMBINED_IMAGE_SAMPLER,
+		descriptorCount = 1,
+		stageFlags      = {.FRAGMENT},
+	}
+	bindings := []vk.DescriptorSetLayoutBinding{ubo_layout_binding, image_sampler_binding}
 
 	layout_info: vk.DescriptorSetLayoutCreateInfo = {
 		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		bindingCount = 1,
-		pBindings    = &ubo_layout_binding,
+		bindingCount = u32(len(bindings)),
+		pBindings    = raw_data(bindings),
 	}
 
 	vk_check(vk.CreateDescriptorSetLayout(r.device, &layout_info, nil, &r.descriptor_set_layout))
@@ -817,7 +844,7 @@ destroy_descriptor_set_layout :: proc() {
 
 @(private)
 create_graphics_pipeline :: proc() -> (ok: bool) {
-	shader_code := #load("./default_shaders/ubo.spv")
+	shader_code := #load(DEFAULT_SHADER)
 	shader_module := create_shader_module(shader_code)
 	defer vk.DestroyShaderModule(r.device, shader_module, nil)
 
@@ -870,8 +897,8 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		depthClampEnable        = false,
 		rasterizerDiscardEnable = false,
 		polygonMode             = .FILL,
-		cullMode                = {},
-		frontFace               = .CLOCKWISE,
+		cullMode                = {.BACK},
+		frontFace               = .COUNTER_CLOCKWISE,
 		depthBiasEnable         = false,
 		depthBiasSlopeFactor    = 1,
 		lineWidth               = 1,
@@ -960,6 +987,193 @@ destroy_command_pool :: proc() {
 }
 
 @(private)
+create_texture_image :: proc() -> (ok: bool) {
+	width, height, channels: i32
+	data := stbi.load(TEXTURE_IMAGE, &width, &height, &channels, 4)
+	size := width * height * 4
+
+	if data == nil {
+		log.fatalf("failed to load %s", TEXTURE_IMAGE)
+		return false
+	}
+	defer stbi.image_free(data)
+
+	image_info: vk.ImageCreateInfo = {
+		sType = .IMAGE_CREATE_INFO,
+		imageType = .D2,
+		format = .R8G8B8A8_SRGB,
+		extent = {width = u32(width), height = u32(height), depth = 1},
+		mipLevels = 1,
+		arrayLayers = 1,
+		samples = {._1},
+		tiling = .OPTIMAL,
+		usage = {.TRANSFER_DST, .SAMPLED},
+		initialLayout = .UNDEFINED,
+	}
+	alloc_info: vma.Allocation_Create_Info = {
+		usage = .Auto,
+	}
+	vk_check(
+		vma.create_image(
+			r.allocators.gpu,
+			image_info,
+			alloc_info,
+			&r.texture_image.image,
+			&r.texture_image.allocation,
+			nil,
+		),
+	)
+
+	view_info: vk.ImageViewCreateInfo = {
+		sType = .IMAGE_VIEW_CREATE_INFO,
+		image = r.texture_image.image,
+		viewType = .D2,
+		format = .R8G8B8A8_SRGB,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			layerCount = 1,
+			baseArrayLayer = 0,
+			levelCount = 1,
+			baseMipLevel = 0,
+		},
+	}
+	vk_check(vk.CreateImageView(r.device, &view_info, nil, &r.texture_image.view))
+
+	img_buf: vk.Buffer
+	img_alloc: vma.Allocation
+	img_buf_info: vk.BufferCreateInfo = {
+		sType = .BUFFER_CREATE_INFO,
+		size  = vk.DeviceSize(size),
+		usage = {.TRANSFER_SRC},
+	}
+	img_alloc_info: vma.Allocation_Create_Info = {
+		flags = {.Host_Access_Sequential_Write, .Mapped},
+		usage = .Auto,
+	}
+	vk_check(
+		vma.create_buffer(
+			r.allocators.gpu,
+			img_buf_info,
+			img_alloc_info,
+			&img_buf,
+			&img_alloc,
+			nil,
+		),
+	)
+	defer vma.destroy_buffer(r.allocators.gpu, img_buf, img_alloc)
+
+	img_buf_ptr: rawptr
+	vk_check(vma.map_memory(r.allocators.gpu, img_alloc, &img_buf_ptr))
+	mem.copy(img_buf_ptr, data, int(size))
+
+	fence: vk.Fence
+	fence_info: vk.FenceCreateInfo = {
+		sType = .FENCE_CREATE_INFO,
+	}
+	vk_check(vk.CreateFence(r.device, &fence_info, nil, &fence))
+	defer vk.DestroyFence(r.device, fence, nil)
+
+	// TODO: replace with dedicated one-time buffer/pool
+	cmd_buf: vk.CommandBuffer
+	cmd_buf_info: vk.CommandBufferAllocateInfo = {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = r.command_pool,
+		commandBufferCount = 1,
+	}
+	vk_check(vk.AllocateCommandBuffers(r.device, &cmd_buf_info, &cmd_buf))
+
+	begin_info: vk.CommandBufferBeginInfo = {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT},
+	}
+	vk_check(vk.BeginCommandBuffer(cmd_buf, &begin_info))
+
+	transition_image(
+		cmd_buf,
+		r.texture_image.image,
+		.UNDEFINED,
+		.TRANSFER_DST_OPTIMAL,
+		{},
+		{.TRANSFER_WRITE_KHR},
+		{},
+		{.TRANSFER},
+	)
+
+	copy: vk.BufferImageCopy = {
+		bufferOffset = 0,
+		imageOffset = {0, 0, 0},
+		imageExtent = {width = u32(width), height = u32(height), depth = 1},
+		imageSubresource = {
+			layerCount = 1,
+			baseArrayLayer = 0,
+			aspectMask = {.COLOR},
+			mipLevel = 0,
+		},
+	}
+	vk.CmdCopyBufferToImage(
+		cmd_buf,
+		img_buf,
+		r.texture_image.image,
+		.TRANSFER_DST_OPTIMAL,
+		1,
+		&copy,
+	)
+
+	transition_image(
+		cmd_buf,
+		r.texture_image.image,
+		.TRANSFER_DST_OPTIMAL,
+		.READ_ONLY_OPTIMAL,
+		{.TRANSFER_WRITE},
+		{.SHADER_READ},
+		{.TRANSFER},
+		{.FRAGMENT_SHADER},
+	)
+
+	vk_check(vk.EndCommandBuffer(cmd_buf))
+
+	submit: vk.SubmitInfo = {
+		sType              = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers    = &cmd_buf,
+	}
+	vk_check(vk.QueueSubmit(r.graphics_queue, 1, &submit, fence))
+	vk_check(vk.WaitForFences(r.device, 1, &fence, true, max(u64)))
+
+	properties: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(r.physical_device, &properties)
+
+	sampler_info: vk.SamplerCreateInfo = {
+		sType                   = .SAMPLER_CREATE_INFO,
+		magFilter               = .LINEAR,
+		minFilter               = .LINEAR,
+		mipmapMode              = .LINEAR,
+		mipLodBias              = 0,
+		minLod                  = 0,
+		maxLod                  = 0,
+		addressModeU            = .REPEAT,
+		addressModeV            = .REPEAT,
+		addressModeW            = .REPEAT,
+		anisotropyEnable        = true,
+		maxAnisotropy           = properties.limits.maxSamplerAnisotropy,
+		compareEnable           = false,
+		compareOp               = .ALWAYS,
+		borderColor             = .INT_OPAQUE_BLACK,
+		unnormalizedCoordinates = false,
+	}
+	vk_check(vk.CreateSampler(r.device, &sampler_info, nil, &r.texture_image.sampler))
+
+	return true
+}
+
+@(private)
+destroy_texture_image :: proc() {
+	vk.DestroySampler(r.device, r.texture_image.sampler, nil)
+	vk.DestroyImageView(r.device, r.texture_image.view, nil)
+	vma.destroy_image(r.allocators.gpu, r.texture_image.image, r.texture_image.allocation)
+}
+
+@(private)
 create_vertex_buffer :: proc() -> (ok: bool) {
 	buffer_info: vk.BufferCreateInfo = {
 		sType = .BUFFER_CREATE_INFO,
@@ -1041,17 +1255,17 @@ destroy_uniform_buffers :: proc() {
 
 @(private)
 create_descriptor_pool :: proc() -> (ok: bool) {
-	pool_size: vk.DescriptorPoolSize = {
-		descriptorCount = FRAMES_IN_FLIGHT,
-		type            = .UNIFORM_BUFFER,
+	pool_sizes: []vk.DescriptorPoolSize = {
+		{descriptorCount = FRAMES_IN_FLIGHT, type = .UNIFORM_BUFFER},
+		{descriptorCount = FRAMES_IN_FLIGHT, type = .COMBINED_IMAGE_SAMPLER},
 	}
 
 	pool_info: vk.DescriptorPoolCreateInfo = {
 		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
 		flags         = {.FREE_DESCRIPTOR_SET},
 		maxSets       = FRAMES_IN_FLIGHT,
-		poolSizeCount = 1,
-		pPoolSizes    = &pool_size,
+		poolSizeCount = u32(len(pool_sizes)),
+		pPoolSizes    = raw_data(pool_sizes),
 	}
 
 	vk_check(vk.CreateDescriptorPool(r.device, &pool_info, nil, &r.descriptor_pool))
@@ -1086,21 +1300,43 @@ create_descriptor_sets :: proc() -> (ok: bool) {
 			offset = 0,
 			range  = size_of(UBO),
 		}
+		image_info: vk.DescriptorImageInfo = {
+			imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+			imageView   = r.texture_image.view,
+			sampler     = r.texture_image.sampler,
+		}
 
 		frame.descriptor_set_layout = layouts[i]
 		frame.descriptor_set = descriptor_sets[i]
 
-		descriptor_write: vk.WriteDescriptorSet = {
-			sType           = .WRITE_DESCRIPTOR_SET,
-			dstSet          = frame.descriptor_set,
-			dstBinding      = 0,
-			dstArrayElement = 0,
-			descriptorCount = 1,
-			descriptorType  = .UNIFORM_BUFFER,
-			pBufferInfo     = &buffer_info,
+		descriptor_writes: []vk.WriteDescriptorSet = {
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = frame.descriptor_set,
+				dstBinding = 0,
+				dstArrayElement = 0,
+				descriptorCount = 1,
+				descriptorType = .UNIFORM_BUFFER,
+				pBufferInfo = &buffer_info,
+			},
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = frame.descriptor_set,
+				dstBinding = 1,
+				dstArrayElement = 0,
+				descriptorCount = 1,
+				descriptorType = .COMBINED_IMAGE_SAMPLER,
+				pImageInfo = &image_info,
+			},
 		}
 
-		vk.UpdateDescriptorSets(r.device, 1, &descriptor_write, 0, nil)
+		vk.UpdateDescriptorSets(
+			r.device,
+			u32(len(descriptor_writes)),
+			raw_data(descriptor_writes),
+			0,
+			nil,
+		)
 	}
 
 	return true
@@ -1130,9 +1366,9 @@ create_command_buffers :: proc() -> (ok: bool) {
 }
 
 @(private)
-transition_swapchain_image_layout :: proc(
+transition_image :: proc(
 	buf: vk.CommandBuffer,
-	image_index: int,
+	image: vk.Image,
 	old_layout, new_layout: vk.ImageLayout,
 	src_access_mask, dst_access_mask: vk.AccessFlags2,
 	src_stage_mask, dst_stage_mask: vk.PipelineStageFlags2,
@@ -1147,7 +1383,7 @@ transition_swapchain_image_layout :: proc(
 		newLayout = new_layout,
 		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-		image = r.swapchain.images[image_index],
+		image = image,
 		subresourceRange = {
 			aspectMask = {.COLOR},
 			baseMipLevel = 0,
@@ -1165,6 +1401,26 @@ transition_swapchain_image_layout :: proc(
 	}
 
 	vk.CmdPipelineBarrier2(buf, &dependency_info)
+}
+
+@(private)
+transition_swapchain_image_layout :: proc(
+	buf: vk.CommandBuffer,
+	image_index: int,
+	old_layout, new_layout: vk.ImageLayout,
+	src_access_mask, dst_access_mask: vk.AccessFlags2,
+	src_stage_mask, dst_stage_mask: vk.PipelineStageFlags2,
+) {
+	transition_image(
+		buf,
+		r.swapchain.images[image_index],
+		old_layout,
+		new_layout,
+		src_access_mask,
+		dst_access_mask,
+		src_stage_mask,
+		dst_stage_mask,
+	)
 }
 
 @(private)
@@ -1345,6 +1601,10 @@ init_renderer :: proc(
 	defer if !ok do destroy_command_pool()
 	log.debug("Command pool created")
 
+	create_texture_image() or_return
+	defer if !ok do destroy_texture_image()
+	log.debug("Texture image created")
+
 	create_vertex_buffer() or_return
 	defer if !ok do destroy_vertex_buffer()
 	log.debug("Vertex buffer created")
@@ -1381,6 +1641,7 @@ destroy_renderer :: proc() {
 	destroy_descriptor_pool()
 	destroy_uniform_buffers()
 	destroy_vertex_buffer()
+	destroy_texture_image()
 	destroy_command_pool()
 	destroy_graphics_pipeline()
 	destroy_descriptor_set_layout()
