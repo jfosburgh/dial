@@ -26,6 +26,7 @@ DEFAULT_SHADER :: "./default_shaders/depth_quads.spv"
 ENABLE_DEBUG_MESSENGER :: true
 
 REQUIRED_DEVICE_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+MSAA_LIMIT :: 8
 
 WindowConfig :: struct {
 	window_title, app_id: cstring,
@@ -80,9 +81,11 @@ Renderer :: struct {
 	resize_requested:              bool,
 	start_time:                    time.Time,
 	vertex_buffer:                 AllocatedBuffer,
-	texture_image:                 AllocatedImage,
+	texture_image:                 SampledImage,
+	color_image:                   AllocatedImage,
 	depth_image:                   AllocatedImage,
 	depth_format:                  vk.Format,
+	msaa_samples:                  vk.SampleCountFlags,
 }
 
 r: ^Renderer
@@ -96,8 +99,12 @@ AllocatedImage :: struct {
 	image:      vk.Image,
 	view:       vk.ImageView,
 	allocation: vma.Allocation,
-	sampler:    vk.Sampler,
 	mip_levels: u32,
+}
+
+SampledImage :: struct {
+	using allocated_image: AllocatedImage,
+	sampler:               vk.Sampler,
 }
 
 Vertex :: struct {
@@ -549,6 +556,29 @@ score_physical_device :: proc(device: vk.PhysicalDevice) -> (score: int) {
 }
 
 @(private)
+get_max_usable_sample_count :: proc() -> vk.SampleCountFlag {
+	properties: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(r.physical_device, &properties)
+	counts := properties.limits.framebufferColorSampleCounts
+
+	if ._64 in counts && 64 <= MSAA_LIMIT {
+		return ._64
+	} else if ._32 in counts && 32 <= MSAA_LIMIT {
+		return ._32
+	} else if ._16 in counts && 16 <= MSAA_LIMIT {
+		return ._16
+	} else if ._8 in counts && 8 <= MSAA_LIMIT {
+		return ._8
+	} else if ._4 in counts && 4 <= MSAA_LIMIT {
+		return ._4
+	} else if ._2 in counts && 2 <= MSAA_LIMIT {
+		return ._2
+	}
+
+	return ._1
+}
+
+@(private)
 pick_physical_device :: proc() -> (ok: bool) {
 	physical_device_count: u32
 	vk_check(vk.EnumeratePhysicalDevices(r.instance, &physical_device_count, nil))
@@ -564,6 +594,7 @@ pick_physical_device :: proc() -> (ok: bool) {
 	for device in devices {
 		if score_physical_device(device) > best_score {
 			r.physical_device = device
+			r.msaa_samples = {get_max_usable_sample_count()}
 		}
 	}
 
@@ -592,6 +623,7 @@ create_logical_device :: proc() -> (ok: bool) {
 
 	device_features: vk.PhysicalDeviceFeatures = {
 		samplerAnisotropy = true,
+		sampleRateShading = true,
 	}
 
 	extended_dynamic_features: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT = {
@@ -837,12 +869,14 @@ recreate_swapchain :: proc() {
 	log.debugf("resizing swapchain to %dx%d", width, height)
 	vk_check(vk.DeviceWaitIdle(r.device))
 
+	destroy_depth_resources()
+	destroy_color_resources()
 	destroy_swapchain_data()
 	destroy_swapchain()
-	destroy_depth_resources()
 
 	create_swapchain()
 	create_swapchain_data()
+	create_color_resources()
 	create_depth_resources()
 }
 
@@ -955,8 +989,9 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 
 	multisampling: vk.PipelineMultisampleStateCreateInfo = {
 		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-		rasterizationSamples = {._1},
-		sampleShadingEnable  = false,
+		rasterizationSamples = r.msaa_samples,
+		sampleShadingEnable  = true,
+		minSampleShading     = 1,
 	}
 
 	color_blend_attachment: vk.PipelineColorBlendAttachmentState = {
@@ -1078,6 +1113,28 @@ has_stencil_component :: proc(format: vk.Format) -> bool {
 }
 
 @(private)
+create_color_resources :: proc() -> (ok: bool) {
+	color_format := r.swapchain.format
+	create_image(
+		&r.color_image,
+		r.swapchain.extent.width,
+		r.swapchain.extent.height,
+		r.swapchain.format,
+		{.TRANSIENT_ATTACHMENT, .COLOR_ATTACHMENT},
+		1,
+		r.msaa_samples,
+	)
+
+	return true
+}
+
+@(private)
+destroy_color_resources :: proc() {
+	vk.DestroyImageView(r.device, r.color_image.view, nil)
+	vma.destroy_image(r.allocators.gpu, r.color_image.image, r.color_image.allocation)
+}
+
+@(private)
 create_depth_resources :: proc() -> (ok: bool) {
 	r.depth_format = find_depth_format()
 	create_image(
@@ -1087,6 +1144,7 @@ create_depth_resources :: proc() -> (ok: bool) {
 		r.depth_format,
 		{.DEPTH_STENCIL_ATTACHMENT},
 		1,
+		msaa_samples = r.msaa_samples,
 	)
 
 	return true
@@ -1105,6 +1163,7 @@ create_image :: proc(
 	format: vk.Format,
 	usage: vk.ImageUsageFlags,
 	mip_levels: u32 = 1,
+	msaa_samples: vk.SampleCountFlags = {._1},
 ) {
 	image_info: vk.ImageCreateInfo = {
 		sType = .IMAGE_CREATE_INFO,
@@ -1113,7 +1172,7 @@ create_image :: proc(
 		extent = {width = width, height = height, depth = 1},
 		mipLevels = mip_levels,
 		arrayLayers = 1,
-		samples = {._1},
+		samples = msaa_samples,
 		tiling = .OPTIMAL,
 		usage = usage,
 		initialLayout = .UNDEFINED,
@@ -1196,7 +1255,6 @@ end_single_time_commands :: proc(cmd_buf: ^vk.CommandBuffer) {
 
 @(private)
 generate_mipmaps :: proc(image: AllocatedImage, format: vk.Format, #any_int width, height: u32) {
-	log.debug("generating mipmaps")
 	properties: vk.FormatProperties
 	vk.GetPhysicalDeviceFormatProperties(r.physical_device, format, &properties)
 	if properties.optimalTilingFeatures & {.SAMPLED_IMAGE_FILTER_LINEAR} !=
@@ -1221,7 +1279,6 @@ generate_mipmaps :: proc(image: AllocatedImage, format: vk.Format, #any_int widt
 	mip_height := i32(height)
 
 	for i in 1 ..< image.mip_levels {
-		log.debugf("generating mip from %dx%d", mip_width, mip_height)
 		barrier.subresourceRange.baseMipLevel = i - 1
 		barrier.oldLayout = .TRANSFER_DST_OPTIMAL
 		barrier.newLayout = .TRANSFER_SRC_OPTIMAL
@@ -1269,7 +1326,6 @@ generate_mipmaps :: proc(image: AllocatedImage, format: vk.Format, #any_int widt
 		barrier.newLayout = .SHADER_READ_ONLY_OPTIMAL
 		barrier.srcAccessMask = {.TRANSFER_READ}
 		barrier.dstAccessMask = {.SHADER_READ}
-		log.debug("second barrier")
 		vk.CmdPipelineBarrier(
 			buf,
 			{.TRANSFER},
@@ -1684,6 +1740,17 @@ record_command_buffer :: proc(image_index: int) {
 		{.COLOR_ATTACHMENT_OUTPUT},
 	)
 
+	transition_image(
+		buf,
+		r.color_image.image,
+		.UNDEFINED,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		{},
+		{.COLOR_ATTACHMENT_WRITE},
+		{.COLOR_ATTACHMENT_OUTPUT},
+		{.COLOR_ATTACHMENT_OUTPUT},
+	)
+
 	depth_aspect: vk.ImageAspectFlags = {.DEPTH}
 	if has_stencil_component(r.depth_format) {
 		depth_aspect |= {.STENCIL}
@@ -1706,13 +1773,17 @@ record_command_buffer :: proc(image_index: int) {
 	clear_depth: vk.ClearValue = {
 		depthStencil = {depth = 1, stencil = 0},
 	}
+	resolve_mode: vk.ResolveModeFlags = {.SAMPLE_ZERO} if ._1 in r.msaa_samples else {.AVERAGE}
 	color_attachment_info: vk.RenderingAttachmentInfo = {
-		sType       = .RENDERING_ATTACHMENT_INFO,
-		clearValue  = clear_color,
-		imageView   = r.swapchain.views[image_index],
-		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
-		loadOp      = .CLEAR,
-		storeOp     = .STORE,
+		sType              = .RENDERING_ATTACHMENT_INFO,
+		clearValue         = clear_color,
+		resolveMode        = resolve_mode,
+		imageView          = r.color_image.view,
+		imageLayout        = .COLOR_ATTACHMENT_OPTIMAL,
+		resolveImageView   = r.swapchain.views[image_index],
+		resolveImageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		loadOp             = .CLEAR,
+		storeOp            = .STORE,
 	}
 	depth_attachment_info: vk.RenderingAttachmentInfo = {
 		sType       = .RENDERING_ATTACHMENT_INFO,
@@ -1874,6 +1945,10 @@ init_renderer :: proc(
 	defer if !ok do destroy_command_pool()
 	log.debug("Command pool created")
 
+	create_color_resources() or_return
+	defer if !ok do destroy_color_resources()
+	log.debug("Color resources created")
+
 	create_depth_resources() or_return
 	defer if !ok do destroy_depth_resources()
 	log.debug("Depth resources created")
@@ -1924,6 +1999,7 @@ destroy_renderer :: proc() {
 	destroy_vertex_buffer()
 	destroy_texture_image()
 	destroy_depth_resources()
+	destroy_color_resources()
 	destroy_command_pool()
 	destroy_graphics_pipeline()
 	destroy_descriptor_set_layout()
@@ -1961,7 +2037,7 @@ update_uniform_buffer :: proc() {
 	ubo := UBO{}
 	elapsed := time.duration_seconds(time.since(r.start_time))
 
-	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(30)) * f32(elapsed), {0, 0, 1})
+	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(90)) * f32(elapsed), {0, 0, 1})
 	ubo.view = glm.matrix4_look_at_f32({2, 2, 2}, {0, 0, 0}, {0, 0, 1})
 	ubo.proj = matrix4_perspective_z0_f32(
 		glm.to_radians(f32(45)),
