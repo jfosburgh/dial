@@ -97,6 +97,7 @@ AllocatedImage :: struct {
 	view:       vk.ImageView,
 	allocation: vma.Allocation,
 	sampler:    vk.Sampler,
+	mip_levels: u32,
 }
 
 Vertex :: struct {
@@ -1147,11 +1148,153 @@ create_image :: proc(
 			aspectMask = aspect,
 			layerCount = 1,
 			baseArrayLayer = 0,
-			levelCount = 1,
+			levelCount = mip_levels,
 			baseMipLevel = 0,
 		},
 	}
 	vk_check(vk.CreateImageView(r.device, &view_info, nil, &image.view))
+	image.mip_levels = mip_levels
+}
+
+@(private)
+begin_single_time_commands :: proc() -> vk.CommandBuffer {
+	cmd_buf: vk.CommandBuffer
+	cmd_buf_info: vk.CommandBufferAllocateInfo = {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = r.command_pool,
+		commandBufferCount = 1,
+	}
+	vk_check(vk.AllocateCommandBuffers(r.device, &cmd_buf_info, &cmd_buf))
+
+	begin_info: vk.CommandBufferBeginInfo = {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT},
+	}
+	vk_check(vk.BeginCommandBuffer(cmd_buf, &begin_info))
+	return cmd_buf
+}
+
+@(private)
+end_single_time_commands :: proc(cmd_buf: ^vk.CommandBuffer) {
+	fence: vk.Fence
+	fence_info: vk.FenceCreateInfo = {
+		sType = .FENCE_CREATE_INFO,
+	}
+	vk_check(vk.CreateFence(r.device, &fence_info, nil, &fence))
+	defer vk.DestroyFence(r.device, fence, nil)
+
+	vk_check(vk.EndCommandBuffer(cmd_buf^))
+
+	submit: vk.SubmitInfo = {
+		sType              = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers    = cmd_buf,
+	}
+	vk_check(vk.QueueSubmit(r.graphics_queue, 1, &submit, fence))
+	vk_check(vk.WaitForFences(r.device, 1, &fence, true, max(u64)))
+}
+
+@(private)
+generate_mipmaps :: proc(image: AllocatedImage, format: vk.Format, #any_int width, height: u32) {
+	log.debug("generating mipmaps")
+	properties: vk.FormatProperties
+	vk.GetPhysicalDeviceFormatProperties(r.physical_device, format, &properties)
+	if properties.optimalTilingFeatures & {.SAMPLED_IMAGE_FILTER_LINEAR} !=
+	   {.SAMPLED_IMAGE_FILTER_LINEAR} {
+		panic("texture image format does not support linear blitting")
+	}
+
+	buf := begin_single_time_commands()
+
+	barrier: vk.ImageMemoryBarrier = {
+		sType = .IMAGE_MEMORY_BARRIER,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseArrayLayer = 0,
+			layerCount = 1,
+			levelCount = 1,
+		},
+		image = image.image,
+	}
+
+	mip_width := i32(width)
+	mip_height := i32(height)
+
+	for i in 1 ..< image.mip_levels {
+		log.debugf("generating mip from %dx%d", mip_width, mip_height)
+		barrier.subresourceRange.baseMipLevel = i - 1
+		barrier.oldLayout = .TRANSFER_DST_OPTIMAL
+		barrier.newLayout = .TRANSFER_SRC_OPTIMAL
+		barrier.srcAccessMask = {.TRANSFER_WRITE}
+		barrier.dstAccessMask = {.TRANSFER_READ}
+		vk.CmdPipelineBarrier(buf, {.TRANSFER}, {.TRANSFER}, {}, 0, nil, 0, nil, 1, &barrier)
+
+		offsets, dst_offsets: [2]vk.Offset3D
+		offsets[0] = {0, 0, 0}
+		offsets[1] = {mip_width, mip_height, 1}
+		dst_offsets[0] = {0, 0, 0}
+		dst_offsets[1] = {
+			1 if mip_width == 1 else mip_width / 2,
+			1 if mip_height == 1 else mip_height / 2,
+			1,
+		}
+		blit: vk.ImageBlit = {
+			srcOffsets = offsets,
+			dstOffsets = dst_offsets,
+			srcSubresource = {
+				aspectMask = {.COLOR},
+				baseArrayLayer = 0,
+				layerCount = 1,
+				mipLevel = i - 1,
+			},
+			dstSubresource = {
+				aspectMask = {.COLOR},
+				baseArrayLayer = 0,
+				layerCount = 1,
+				mipLevel = i,
+			},
+		}
+		vk.CmdBlitImage(
+			buf,
+			image.image,
+			.TRANSFER_SRC_OPTIMAL,
+			image.image,
+			.TRANSFER_DST_OPTIMAL,
+			1,
+			&blit,
+			.LINEAR,
+		)
+
+		barrier.oldLayout = .TRANSFER_SRC_OPTIMAL
+		barrier.newLayout = .SHADER_READ_ONLY_OPTIMAL
+		barrier.srcAccessMask = {.TRANSFER_READ}
+		barrier.dstAccessMask = {.SHADER_READ}
+		log.debug("second barrier")
+		vk.CmdPipelineBarrier(
+			buf,
+			{.TRANSFER},
+			{.FRAGMENT_SHADER},
+			{},
+			0,
+			nil,
+			0,
+			nil,
+			1,
+			&barrier,
+		)
+
+		if mip_width > 1 do mip_width /= 2
+		if mip_height > 1 do mip_height /= 2
+	}
+
+	barrier.subresourceRange.baseMipLevel = image.mip_levels - 1
+	barrier.oldLayout = .TRANSFER_DST_OPTIMAL
+	barrier.newLayout = .SHADER_READ_ONLY_OPTIMAL
+	barrier.srcAccessMask = {.TRANSFER_READ}
+	barrier.dstAccessMask = {.SHADER_READ}
+	vk.CmdPipelineBarrier(buf, {.TRANSFER}, {.FRAGMENT_SHADER}, {}, 0, nil, 0, nil, 1, &barrier)
+
+	end_single_time_commands(&buf)
 }
 
 @(private)
@@ -1171,7 +1314,8 @@ create_texture_image :: proc() -> (ok: bool) {
 		u32(width),
 		u32(height),
 		.R8G8B8A8_SRGB,
-		{.TRANSFER_DST, .SAMPLED},
+		{.TRANSFER_SRC, .TRANSFER_DST, .SAMPLED},
+		mip_levels = u32(math.floor(math.log2(f32(max(width, height))))) + 1,
 	)
 
 	img_buf: vk.Buffer
@@ -1201,27 +1345,8 @@ create_texture_image :: proc() -> (ok: bool) {
 	vk_check(vma.map_memory(r.allocators.gpu, img_alloc, &img_buf_ptr))
 	mem.copy(img_buf_ptr, data, int(size))
 
-	fence: vk.Fence
-	fence_info: vk.FenceCreateInfo = {
-		sType = .FENCE_CREATE_INFO,
-	}
-	vk_check(vk.CreateFence(r.device, &fence_info, nil, &fence))
-	defer vk.DestroyFence(r.device, fence, nil)
-
 	// TODO: replace with dedicated one-time buffer/pool
-	cmd_buf: vk.CommandBuffer
-	cmd_buf_info: vk.CommandBufferAllocateInfo = {
-		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
-		commandPool        = r.command_pool,
-		commandBufferCount = 1,
-	}
-	vk_check(vk.AllocateCommandBuffers(r.device, &cmd_buf_info, &cmd_buf))
-
-	begin_info: vk.CommandBufferBeginInfo = {
-		sType = .COMMAND_BUFFER_BEGIN_INFO,
-		flags = {.ONE_TIME_SUBMIT},
-	}
-	vk_check(vk.BeginCommandBuffer(cmd_buf, &begin_info))
+	cmd_buf := begin_single_time_commands()
 
 	transition_image(
 		cmd_buf,
@@ -1232,6 +1357,7 @@ create_texture_image :: proc() -> (ok: bool) {
 		{.TRANSFER_WRITE_KHR},
 		{},
 		{.TRANSFER},
+		mip_levels = r.texture_image.mip_levels,
 	)
 
 	copy: vk.BufferImageCopy = {
@@ -1254,26 +1380,9 @@ create_texture_image :: proc() -> (ok: bool) {
 		&copy,
 	)
 
-	transition_image(
-		cmd_buf,
-		r.texture_image.image,
-		.TRANSFER_DST_OPTIMAL,
-		.READ_ONLY_OPTIMAL,
-		{.TRANSFER_WRITE},
-		{.SHADER_READ},
-		{.TRANSFER},
-		{.FRAGMENT_SHADER},
-	)
+	end_single_time_commands(&cmd_buf)
 
-	vk_check(vk.EndCommandBuffer(cmd_buf))
-
-	submit: vk.SubmitInfo = {
-		sType              = .SUBMIT_INFO,
-		commandBufferCount = 1,
-		pCommandBuffers    = &cmd_buf,
-	}
-	vk_check(vk.QueueSubmit(r.graphics_queue, 1, &submit, fence))
-	vk_check(vk.WaitForFences(r.device, 1, &fence, true, max(u64)))
+	generate_mipmaps(r.texture_image, .R8G8B8A8_SRGB, width, height)
 
 	properties: vk.PhysicalDeviceProperties
 	vk.GetPhysicalDeviceProperties(r.physical_device, &properties)
@@ -1285,7 +1394,7 @@ create_texture_image :: proc() -> (ok: bool) {
 		mipmapMode              = .LINEAR,
 		mipLodBias              = 0,
 		minLod                  = 0,
-		maxLod                  = 0,
+		maxLod                  = vk.LOD_CLAMP_NONE,
 		addressModeU            = .REPEAT,
 		addressModeV            = .REPEAT,
 		addressModeW            = .REPEAT,
@@ -1506,6 +1615,7 @@ transition_image :: proc(
 	src_access_mask, dst_access_mask: vk.AccessFlags2,
 	src_stage_mask, dst_stage_mask: vk.PipelineStageFlags2,
 	aspect_mask: vk.ImageAspectFlags = {.COLOR},
+	mip_levels: u32 = 1,
 ) {
 	barrier: vk.ImageMemoryBarrier2 = {
 		sType = .IMAGE_MEMORY_BARRIER_2,
@@ -1521,7 +1631,7 @@ transition_image :: proc(
 		subresourceRange = {
 			aspectMask = aspect_mask,
 			baseMipLevel = 0,
-			levelCount = 1,
+			levelCount = mip_levels,
 			baseArrayLayer = 0,
 			layerCount = 1,
 		},
