@@ -8,6 +8,7 @@ import "core:mem"
 import "core:slice"
 import "core:time"
 
+import obj "../../loaders/tinyobj"
 import "shared:vma"
 import sdl "vendor:sdl3"
 import stbi "vendor:stb/image"
@@ -18,7 +19,8 @@ HEIGHT :: 720
 
 FRAMES_IN_FLIGHT :: 2
 
-TEXTURE_IMAGE :: "assets/images/texture.jpg"
+MODEL_PATH :: "assets/models/viking_room/viking_room.obj"
+TEXTURE_IMAGE :: "assets/models/viking_room/viking_room.png"
 DEFAULT_SHADER :: "./default_shaders/depth_quads.spv"
 
 ENABLE_DEBUG_MESSENGER :: true
@@ -128,21 +130,53 @@ get_vertex_attribute_descriptions :: proc(
 	}
 }
 
-triangle_vertices: []Vertex = {
-	{{-0.5, -0.5, 0}, {1.0, 0.0, 0.0}, {1, 0}},
-	{{0.5, -0.5, 0}, {0.0, 1.0, 0.0}, {0, 0}},
-	{{0.5, 0.5, 0}, {0.0, 0.0, 1.0}, {0, 1}},
-	{{-0.5, 0.5, 0}, {1.0, 1.0, 1.0}, {1, 1}},
-	{{-0.5, -0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
-	{{0.5, -0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
-	{{0.5, 0.5, -0.5}, {0.0, 0.0, 1.0}, {0, 1}},
-	{{-0.5, 0.5, -0.5}, {1.0, 1.0, 1.0}, {1, 1}},
-}
-
-triangle_indices: []u16 = {0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4}
-
 UBO :: struct {
 	model, view, proj: matrix[4, 4]f32,
+}
+
+// vertices: []Vertex
+// indices: []u32
+
+vertices: []Vertex = {
+	{{-0.5, -0.5, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0}},
+	{{0.5, -0.5, 0.0}, {0.0, 1.0, 0.0}, {1.0, 0.0}},
+	{{0.5, 0.5, 0.0}, {0.0, 0.0, 1.0}, {1.0, 1.0}},
+	{{-0.5, 0.5, 0.0}, {1.0, 1.0, 1.0}, {0.0, 1.0}},
+	{{-0.5, -0.5, -0.5}, {1.0, 0.0, 0.0}, {0.0, 0.0}},
+	{{0.5, -0.5, -0.5}, {0.0, 1.0, 0.0}, {1.0, 0.0}},
+	{{0.5, 0.5, -0.5}, {0.0, 0.0, 1.0}, {1.0, 1.0}},
+	{{-0.5, 0.5, -0.5}, {1.0, 1.0, 1.0}, {0.0, 1.0}},
+}
+
+indices: []u32 = {0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4}
+
+load_model :: proc(filepath: string) {
+	local_vertices := make([dynamic]Vertex, r.allocators.cpu)
+	defer delete(local_vertices)
+	local_indices := make([dynamic]u32, r.allocators.cpu)
+	defer delete(local_indices)
+	vert_map := make(map[Vertex]u32, r.allocators.cpu)
+	defer delete(vert_map)
+
+	model := obj.load_from_filepath(filepath, r.allocators.cpu)
+	for tri in model.tris {
+		for tri_vert in tri {
+			v: Vertex
+
+			v.pos = model.vertices[tri_vert.x - 1].xyz
+			v.tex = model.tex_coords[tri_vert.y - 1].xy
+			v.tex.y = 1 - v.tex.y
+
+			if _, ok := vert_map[v]; !ok {
+				vert_map[v] = u32(len(local_vertices))
+				append(&local_vertices, v)
+			}
+			append(&local_indices, vert_map[v])
+		}
+	}
+
+	vertices = slice.clone(local_vertices[:], r.allocators.cpu)
+	indices = slice.clone(local_indices[:], r.allocators.cpu)
 }
 
 vk_check :: proc(res: vk.Result, loc := #caller_location) {
@@ -941,7 +975,7 @@ create_graphics_pipeline :: proc() -> (ok: bool) {
 		sType                 = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
 		depthTestEnable       = true,
 		depthWriteEnable      = true,
-		depthCompareOp        = .LESS,
+		depthCompareOp        = .LESS_OR_EQUAL,
 		depthBoundsTestEnable = false,
 		stencilTestEnable     = false,
 	}
@@ -1099,8 +1133,10 @@ create_image :: proc(
 
 	aspect: vk.ImageAspectFlags = {.COLOR}
 	#partial switch format {
-	case .D32_SFLOAT, .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT:
+	case .D32_SFLOAT:
 		aspect = {.DEPTH}
+	case .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT:
+		aspect = {.DEPTH, .STENCIL}
 	}
 	view_info: vk.ImageViewCreateInfo = {
 		sType = .IMAGE_VIEW_CREATE_INFO,
@@ -1276,9 +1312,7 @@ destroy_texture_image :: proc() {
 create_vertex_buffer :: proc() -> (ok: bool) {
 	buffer_info: vk.BufferCreateInfo = {
 		sType = .BUFFER_CREATE_INFO,
-		size  = vk.DeviceSize(
-			size_of(Vertex) * len(triangle_vertices) + size_of(u16) * len(triangle_indices),
-		),
+		size  = vk.DeviceSize(size_of(Vertex) * len(vertices) + size_of(u32) * len(indices)),
 		usage = {.VERTEX_BUFFER, .INDEX_BUFFER},
 	}
 	vma_info: vma.Allocation_Create_Info = {
@@ -1301,9 +1335,9 @@ create_vertex_buffer :: proc() -> (ok: bool) {
 	data: rawptr
 	vma.map_memory(r.allocators.gpu, r.vertex_buffer.allocation, &data)
 	defer vma.unmap_memory(r.allocators.gpu, r.vertex_buffer.allocation)
-	mem.copy(data, rawptr(&triangle_vertices[0]), size_of(Vertex) * len(triangle_vertices))
-	data = rawptr(mem.ptr_offset(cast(^byte)data, size_of(Vertex) * len(triangle_vertices)))
-	mem.copy(data, rawptr(&triangle_indices[0]), size_of(u16) * len(triangle_indices))
+	mem.copy(data, rawptr(&vertices[0]), size_of(Vertex) * len(vertices))
+	data = rawptr(mem.ptr_offset(cast(^byte)data, size_of(Vertex) * len(vertices)))
+	mem.copy(data, rawptr(&indices[0]), size_of(u32) * len(indices))
 
 	return true
 }
@@ -1600,13 +1634,15 @@ record_command_buffer :: proc(image_index: int) {
 	vk.CmdBindIndexBuffer(
 		buf,
 		r.vertex_buffer.buffer,
-		vk.DeviceSize(size_of(Vertex) * len(triangle_vertices)),
-		.UINT16,
+		vk.DeviceSize(size_of(Vertex) * len(vertices)),
+		.UINT32,
 	)
 
 	viewport: vk.Viewport = {
-		width  = f32(r.swapchain.extent.width),
-		height = f32(r.swapchain.extent.height),
+		width    = f32(r.swapchain.extent.width),
+		height   = f32(r.swapchain.extent.height),
+		minDepth = 0,
+		maxDepth = 1,
 	}
 	vk.CmdSetViewport(buf, 0, 1, &viewport)
 
@@ -1626,7 +1662,7 @@ record_command_buffer :: proc(image_index: int) {
 		0,
 		nil,
 	)
-	vk.CmdDrawIndexed(buf, u32(len(triangle_indices)), 1, 0, 0, 0)
+	vk.CmdDrawIndexed(buf, u32(len(indices)), 1, 0, 0, 0)
 	vk.CmdEndRendering(buf)
 
 	transition_swapchain_image_layout(
@@ -1689,6 +1725,9 @@ init_renderer :: proc(
 	r.allocators.cpu = allocator
 	r.allocators.temp = temp_allocator
 	r.ctx = context
+
+	load_model(MODEL_PATH)
+	log.debugf("vertices: %d, indices: %d", len(vertices), len(indices))
 
 	init_window(window_config) or_return
 	defer if !ok do destroy_window()
@@ -1812,12 +1851,12 @@ update_uniform_buffer :: proc() {
 	ubo := UBO{}
 	elapsed := time.duration_seconds(time.since(r.start_time))
 
-	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(90)) * f32(elapsed), {0, 0, 1})
+	ubo.model = glm.matrix4_rotate_f32(glm.to_radians(f32(30)) * f32(elapsed), {0, 0, 1})
 	ubo.view = glm.matrix4_look_at_f32({2, 2, 2}, {0, 0, 0}, {0, 0, 1})
 	ubo.proj = matrix4_perspective_z0_f32(
 		glm.to_radians(f32(45)),
 		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
-		0.1,
+		0.01,
 		10,
 	)
 
