@@ -24,6 +24,7 @@ MAX_MODELS :: 128
 // TODO: make this dynamic
 MAX_VERTICES :: 1_000_000
 MAX_INDICES :: 1_000_000
+MAX_INDIRECT_DRAW :: 1024
 
 MODEL_PATH :: "assets/models/viking_room/viking_room.obj"
 TEXTURE_IMAGE :: "assets/models/viking_room/viking_room.png"
@@ -94,6 +95,7 @@ Renderer :: struct {
 	models:                        [3]Model,
 	object_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
 	camera_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
+	indirect_buffers:              [FRAMES_IN_FLIGHT]AllocatedBuffer,
 	global_vertex_buffer:          AllocatedBuffer,
 	global_index_buffer:           AllocatedBuffer,
 	vertex_buffer_offset:          u32,
@@ -165,7 +167,13 @@ Model :: struct {
 }
 
 ObjectData :: struct {
-	model: matrix[4, 4]f32,
+	model:      matrix[4, 4]f32,
+	texture_id: u32,
+	_pad:       [3]u32,
+}
+
+PushConstant :: struct {
+	draw_index_offset: u32,
 }
 
 CameraData :: struct {
@@ -693,6 +701,7 @@ create_logical_device :: proc() -> (ok: bool) {
 	device_features: vk.PhysicalDeviceFeatures = {
 		samplerAnisotropy = true,
 		sampleRateShading = true,
+		multiDrawIndirect = true,
 	}
 
 	extended_dynamic_features: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT = {
@@ -985,7 +994,7 @@ create_descriptor_set_layout :: proc() -> (layout: vk.DescriptorSetLayout, ok: b
 		binding         = 2,
 		descriptorType  = .STORAGE_BUFFER,
 		descriptorCount = 1,
-		stageFlags      = {.VERTEX},
+		stageFlags      = {.VERTEX, .FRAGMENT},
 	}
 	texture_binding: vk.DescriptorSetLayoutBinding = {
 		binding         = 3,
@@ -1124,9 +1133,9 @@ create_graphics_pipeline :: proc(
 	}
 
 	push_constant_range: vk.PushConstantRange = {
-		stageFlags = {.VERTEX, .FRAGMENT},
+		stageFlags = {.VERTEX},
 		offset     = 0,
-		size       = size_of(u32) * 2,
+		size       = size_of(PushConstant),
 	}
 
 	pipeline_layout_info: vk.PipelineLayoutCreateInfo = {
@@ -1655,6 +1664,21 @@ create_buffers :: proc() -> (ok: bool) {
 		)
 	}
 
+	buffer_info.size = vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * MAX_INDIRECT_DRAW)
+	buffer_info.usage = {.TRANSFER_DST, .INDIRECT_BUFFER}
+	for i in 0 ..< FRAMES_IN_FLIGHT {
+		vk_check(
+			vma.create_buffer(
+				r.allocators.gpu,
+				buffer_info,
+				vma_info,
+				&r.indirect_buffers[i].buffer,
+				&r.indirect_buffers[i].allocation,
+				nil,
+			),
+		)
+	}
+
 	buffer_info.size = vk.DeviceSize(size_of(Vertex) * MAX_VERTICES)
 	buffer_info.usage = {.STORAGE_BUFFER, .TRANSFER_DST}
 	vk_check(
@@ -1690,6 +1714,9 @@ destroy_buffers :: proc() {
 		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
 	}
 	for buf in r.camera_buffers {
+		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
+	}
+	for buf in r.indirect_buffers {
 		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
 	}
 	vma.destroy_buffer(
@@ -1986,11 +2013,38 @@ record_command_buffer :: proc(image_index: int) {
 
 	vk.CmdBindIndexBuffer(buf, r.global_index_buffer.buffer, 0, .UINT32)
 
-	bound_mesh: ^GpuMesh
+	indirect_ptr: rawptr
+	vk_check(
+		vma.map_memory(
+			r.allocators.gpu,
+			r.indirect_buffers[frame_index].allocation,
+			&indirect_ptr,
+		),
+	)
+	defer vma.unmap_memory(r.allocators.gpu, r.indirect_buffers[frame_index].allocation)
+
+	indirect_commands := slice.from_ptr(
+		cast(^vk.DrawIndexedIndirectCommand)indirect_ptr,
+		MAX_INDIRECT_DRAW,
+	)
+	indirect_count := 0
+	total_drawn := 0
+
 	bound_pipeline: ^GpuPipeline
-	bound_texture: ^GpuTexture
 	for &model, i in r.models {
 		if model.pipeline != bound_pipeline {
+			if indirect_count > 0 {
+				vk.CmdDrawIndexedIndirect(
+					buf,
+					r.indirect_buffers[frame_index].buffer,
+					vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * total_drawn),
+					u32(indirect_count),
+					size_of(vk.DrawIndexedIndirectCommand),
+				)
+				total_drawn += indirect_count
+				indirect_count = 0
+			}
+
 			bound_pipeline = model.pipeline
 			vk.CmdBindPipeline(buf, .GRAPHICS, bound_pipeline.pipeline)
 			vk.CmdBindDescriptorSets(
@@ -2003,35 +2057,40 @@ record_command_buffer :: proc(image_index: int) {
 				0,
 				nil,
 			)
+
+			push_constants: PushConstant = {
+				draw_index_offset = u32(total_drawn),
+			}
+			vk.CmdPushConstants(
+				buf,
+				bound_pipeline.layout,
+				{.VERTEX},
+				0,
+				size_of(push_constants),
+				&push_constants,
+			)
 		}
 
-		if model.mesh != bound_mesh {
-			bound_mesh = model.mesh
+		indirect_commands[total_drawn + indirect_count] = {
+			indexCount    = model.mesh.index_count,
+			instanceCount = 1,
+			firstIndex    = u32(model.mesh.index_offset / size_of(u32)),
+			vertexOffset  = i32(model.mesh.vertex_offset / size_of(Vertex)),
+			firstInstance = u32(i),
 		}
+		indirect_count += 1
+	}
 
-		if bound_texture != model.texture {
-			bound_texture = model.texture
-		}
-
-		push_constants: [2]u32 = {u32(i), bound_texture.id}
-		vk.CmdPushConstants(
+	if indirect_count > 0 {
+		vk.CmdDrawIndexedIndirect(
 			buf,
-			bound_pipeline.layout,
-			{.VERTEX, .FRAGMENT},
-			0,
-			size_of(push_constants),
-			raw_data(push_constants[:]),
-		)
-
-		vk.CmdDrawIndexed(
-			buf,
-			bound_mesh.index_count,
-			1,
-			u32(bound_mesh.index_offset / size_of(u32)),
-			i32(bound_mesh.vertex_offset / size_of(Vertex)),
-			0,
+			r.indirect_buffers[frame_index].buffer,
+			vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * total_drawn),
+			u32(indirect_count),
+			size_of(vk.DrawIndexedIndirectCommand),
 		)
 	}
+
 	vk.CmdEndRendering(buf)
 
 	transition_swapchain_image_layout(
@@ -2280,6 +2339,7 @@ update_uniform_buffer :: proc() {
 		model.rot.z = elapsed
 		objects[i].model =
 			get_model_matrix(model) * glm.matrix4_rotate_f32(glm.to_radians(f32(90)), {0, 0, 1})
+		objects[i].texture_id = model.texture.id
 	}
 }
 
