@@ -22,13 +22,11 @@ FRAMES_IN_FLIGHT :: 2
 MAX_MODELS :: 128
 
 // TODO: make this dynamic
-MAX_VERTICES :: 1_000_000
-MAX_INDICES :: 1_000_000
 MAX_INDIRECT_DRAW :: 1024
 
 MODEL_PATH :: "assets/models/viking_room/viking_room.obj"
 TEXTURE_IMAGE :: "assets/models/viking_room/viking_room.png"
-DEFAULT_SHADER :: "./default_shaders/vertex_pulling.spv"
+DEFAULT_SHADER :: "./default_shaders/vertex_pulling_bda.spv"
 
 ENABLE_DEBUG_MESSENGER :: true
 
@@ -98,13 +96,9 @@ Renderer :: struct {
 	graphics_pipelines:            hm.Dynamic_Handle_Map(GpuPipeline, Handle),
 	default_pipeline:              Handle,
 	object_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
-	camera_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
 	indirect_buffers:              [FRAMES_IN_FLIGHT]AllocatedBuffer,
-	global_vertex_buffer:          AllocatedBuffer,
-	global_index_buffer:           AllocatedBuffer,
-	vertex_buffer_offset:          u32,
-	index_buffer_offset:           u32,
-	global_descriptor_set:         [FRAMES_IN_FLIGHT]vk.DescriptorSet,
+	global_data_buffers:           [FRAMES_IN_FLIGHT]AllocatedBuffer,
+	global_descriptor_set:         vk.DescriptorSet,
 	draw_info:                     FrameDrawInfo,
 }
 
@@ -113,6 +107,8 @@ r: ^Renderer
 AllocatedBuffer :: struct {
 	buffer:     vk.Buffer,
 	allocation: vma.Allocation,
+	address:    vk.DeviceAddress,
+	mapped:     rawptr,
 }
 
 AllocatedImage :: struct {
@@ -141,10 +137,10 @@ Handle :: struct {
 }
 
 GpuMesh :: struct {
-	vertex_offset: vk.DeviceSize,
-	index_offset:  vk.DeviceSize,
-	index_count:   u32,
-	handle:        Handle,
+	buffer:       AllocatedBuffer,
+	index_offset: vk.DeviceSize,
+	index_count:  u32,
+	handle:       Handle,
 }
 
 GpuTexture :: struct {
@@ -172,13 +168,20 @@ Model :: struct {
 }
 
 ObjectData :: struct {
-	model:      matrix[4, 4]f32,
-	texture_id: u32,
-	_pad:       [3]u32,
+	model:                         matrix[4, 4]f32,
+	texture_id:                    u32,
+	_p1:                           u32,
+	vertex_address, index_address: vk.DeviceAddress,
+	_p2:                           [2]u32,
+}
+
+GlobalData :: struct {
+	view_proj: matrix[4, 4]f32,
 }
 
 PushConstant :: struct {
-	draw_index_offset: u32,
+	global_data_address:   vk.DeviceAddress,
+	object_buffer_address: vk.DeviceAddress,
 }
 
 CameraData :: struct {
@@ -227,28 +230,21 @@ get_model_matrix :: proc(model: Model) -> glm.Matrix4f32 {
 
 create_gpu_mesh :: proc(vertices: []Vertex, indices: []u32) -> (handle: Handle) {
 	mesh: GpuMesh
-	vertex_size := vk.DeviceSize(size_of(Vertex) * len(vertices))
-	index_size := vk.DeviceSize(size_of(u32) * len(indices))
-	mesh.vertex_offset = vk.DeviceSize(r.vertex_buffer_offset * size_of(Vertex))
-	mesh.index_offset = vk.DeviceSize(r.index_buffer_offset * size_of(u32))
+	vertex_size := size_of(Vertex) * len(vertices)
+	index_size := size_of(u32) * len(indices)
+	mesh.index_offset = vk.DeviceSize(vertex_size)
 	mesh.index_count = u32(len(indices))
 
-	data: rawptr
-	{
-		vma.map_memory(r.allocators.gpu, r.global_vertex_buffer.allocation, &data)
-		defer vma.unmap_memory(r.allocators.gpu, r.global_vertex_buffer.allocation)
-		target := rawptr(uintptr(data) + uintptr(mesh.vertex_offset))
-		mem.copy(target, rawptr(&vertices[0]), int(vertex_size))
-	}
-	{
-		vma.map_memory(r.allocators.gpu, r.global_index_buffer.allocation, &data)
-		defer vma.unmap_memory(r.allocators.gpu, r.global_vertex_buffer.allocation)
-		target := rawptr(uintptr(data) + uintptr(mesh.index_offset))
-		mem.copy(target, rawptr(&indices[0]), int(index_size))
-	}
+	create_buffer(
+		&mesh.buffer,
+		u32(vertex_size + index_size),
+		{.STORAGE_BUFFER, .TRANSFER_DST, .SHADER_DEVICE_ADDRESS},
+	)
 
-	r.vertex_buffer_offset += u32(len(vertices))
-	r.index_buffer_offset += u32(len(indices))
+	mem.copy(mesh.buffer.mapped, rawptr(&vertices[0]), int(vertex_size))
+
+	target := rawptr(uintptr(mesh.buffer.mapped) + uintptr(mesh.index_offset))
+	mem.copy(target, rawptr(&indices[0]), int(index_size))
 
 	log.debugf("uploaded %d vertices and %d indices", len(vertices), len(indices))
 
@@ -257,6 +253,8 @@ create_gpu_mesh :: proc(vertices: []Vertex, indices: []u32) -> (handle: Handle) 
 }
 
 destroy_gpu_mesh :: proc(mesh: GpuMesh) {
+	vma.unmap_memory(r.allocators.gpu, mesh.buffer.allocation)
+	vma.destroy_buffer(r.allocators.gpu, mesh.buffer.buffer, mesh.buffer.allocation)
 }
 
 load_model :: proc(filepath: string) -> ([]Vertex, []u32) {
@@ -742,6 +740,7 @@ create_logical_device :: proc() -> (ok: bool) {
 		samplerAnisotropy = true,
 		sampleRateShading = true,
 		multiDrawIndirect = true,
+		shaderInt64       = true,
 	}
 
 	extended_dynamic_features: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT = {
@@ -1018,44 +1017,16 @@ create_shader_module :: proc(code: []byte) -> (shader: vk.ShaderModule) {
 
 @(private)
 create_descriptor_set_layout :: proc() -> (layout: vk.DescriptorSetLayout, ok: bool) {
-	vertex_binding: vk.DescriptorSetLayoutBinding = {
-		binding         = 0,
-		descriptorType  = .STORAGE_BUFFER,
-		descriptorCount = 1,
-		stageFlags      = {.VERTEX},
-	}
-	camera_binding: vk.DescriptorSetLayoutBinding = {
-		binding         = 1,
-		descriptorType  = .UNIFORM_BUFFER,
-		descriptorCount = 1,
-		stageFlags      = {.VERTEX},
-	}
-	object_binding: vk.DescriptorSetLayoutBinding = {
-		binding         = 2,
-		descriptorType  = .STORAGE_BUFFER,
-		descriptorCount = 1,
-		stageFlags      = {.VERTEX, .FRAGMENT},
-	}
 	texture_binding: vk.DescriptorSetLayoutBinding = {
-		binding         = 3,
+		binding         = 0,
 		descriptorType  = .COMBINED_IMAGE_SAMPLER,
 		descriptorCount = 1024,
 		stageFlags      = {.FRAGMENT},
 	}
 
-	bindings := []vk.DescriptorSetLayoutBinding {
-		vertex_binding,
-		camera_binding,
-		object_binding,
-		texture_binding,
-	}
+	bindings := []vk.DescriptorSetLayoutBinding{texture_binding}
 
-	binding_flags := []vk.DescriptorBindingFlags {
-		{},
-		{},
-		{},
-		{.PARTIALLY_BOUND, .UPDATE_AFTER_BIND},
-	}
+	binding_flags := []vk.DescriptorBindingFlags{{.PARTIALLY_BOUND, .UPDATE_AFTER_BIND}}
 	binding_flags_create_info: vk.DescriptorSetLayoutBindingFlagsCreateInfo = {
 		sType         = .DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
 		bindingCount  = u32(len(binding_flags)),
@@ -1522,24 +1493,53 @@ generate_mipmaps :: proc(image: AllocatedImage, format: vk.Format, #any_int widt
 	end_single_time_commands(&buf)
 }
 
+create_buffer :: proc(buffer: ^AllocatedBuffer, size: u32, usage: vk.BufferUsageFlags) {
+	buf_info: vk.BufferCreateInfo = {
+		sType = .BUFFER_CREATE_INFO,
+		size  = vk.DeviceSize(size),
+		usage = usage,
+	}
+	alloc_info: vma.Allocation_Create_Info = {
+		usage = .Auto,
+	}
+	if .TRANSFER_DST in usage {
+		alloc_info.flags |= {.Mapped, .Host_Access_Sequential_Write}
+	}
+	vk_check(
+		vma.create_buffer(
+			r.allocators.gpu,
+			buf_info,
+			alloc_info,
+			&buffer.buffer,
+			&buffer.allocation,
+			nil,
+		),
+	)
+
+	if .Mapped in alloc_info.flags {
+		vma.map_memory(r.allocators.gpu, buffer.allocation, &buffer.mapped)
+	}
+
+	if .SHADER_DEVICE_ADDRESS in usage {
+		address_info: vk.BufferDeviceAddressInfo = {
+			sType  = .BUFFER_DEVICE_ADDRESS_INFO,
+			buffer = buffer.buffer,
+		}
+		buffer.address = vk.GetBufferDeviceAddress(r.device, &address_info)
+	}
+}
+
 @(private)
-create_texture :: proc(
-	filepath: cstring,
+create_texture_from_data :: proc(
+	data: rawptr,
+	width, height, channels: i32,
 	mipped := true,
 ) -> (
 	handle: Handle,
 	ok: bool,
-) #optional_ok {
+) {
 	texture: GpuTexture
-	width, height, channels: i32
-	data := stbi.load(filepath, &width, &height, &channels, 4)
 	size := width * height * 4
-
-	if data == nil {
-		log.fatalf("failed to load %s", filepath)
-		return
-	}
-	defer stbi.image_free(data)
 
 	create_image(
 		&texture.image,
@@ -1640,26 +1640,40 @@ create_texture :: proc(
 		sampler     = texture.image.sampler,
 	}
 
-	writes := make([]vk.WriteDescriptorSet, FRAMES_IN_FLIGHT, r.allocators.cpu)
-	defer delete(writes)
-
-	for i in 0 ..< FRAMES_IN_FLIGHT {
-		writes[i] = {
-			sType           = .WRITE_DESCRIPTOR_SET,
-			dstSet          = r.global_descriptor_set[i],
-			dstBinding      = 3,
-			dstArrayElement = texture.id,
-			descriptorCount = 1,
-			descriptorType  = .COMBINED_IMAGE_SAMPLER,
-			pImageInfo      = &image_info,
-		}
+	write: vk.WriteDescriptorSet = {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = r.global_descriptor_set,
+		dstBinding      = 0,
+		dstArrayElement = texture.id,
+		descriptorCount = 1,
+		descriptorType  = .COMBINED_IMAGE_SAMPLER,
+		pImageInfo      = &image_info,
 	}
 
-	vk.UpdateDescriptorSets(r.device, u32(len(writes)), raw_data(writes), 0, nil)
+	vk.UpdateDescriptorSets(r.device, 1, &write, 0, nil)
 
 	handle, _ = hm.dynamic_add(&r.textures, texture)
-	log.debugf("created texture from %s", filepath)
 	return handle, true
+}
+
+@(private)
+create_texture_from_filepath :: proc(
+	filepath: cstring,
+	mipped := true,
+) -> (
+	handle: Handle,
+	ok: bool,
+) #optional_ok {
+	width, height, channels: i32
+	data := stbi.load(filepath, &width, &height, &channels, 4)
+
+	if data == nil {
+		log.fatalf("failed to load %s", filepath)
+		return
+	}
+	defer stbi.image_free(data)
+
+	return create_texture_from_data(data, width, height, channels)
 }
 
 @(private)
@@ -1682,73 +1696,22 @@ create_buffers :: proc() -> (ok: bool) {
 	}
 
 	for i in 0 ..< FRAMES_IN_FLIGHT {
-		vk_check(
-			vma.create_buffer(
-				r.allocators.gpu,
-				buffer_info,
-				vma_info,
-				&r.object_buffers[i].buffer,
-				&r.object_buffers[i].allocation,
-				nil,
-			),
+		create_buffer(
+			&r.object_buffers[i],
+			size_of(ObjectData) * MAX_MODELS,
+			{.SHADER_DEVICE_ADDRESS, .STORAGE_BUFFER, .TRANSFER_DST},
+		)
+		create_buffer(
+			&r.global_data_buffers[i],
+			size_of(GlobalData),
+			{.SHADER_DEVICE_ADDRESS, .STORAGE_BUFFER, .TRANSFER_DST},
+		)
+		create_buffer(
+			&r.indirect_buffers[i],
+			size_of(vk.DrawIndirectCommand) * MAX_INDIRECT_DRAW,
+			{.INDIRECT_BUFFER, .TRANSFER_DST},
 		)
 	}
-
-	buffer_info.size = vk.DeviceSize(size_of(CameraData))
-	buffer_info.usage = {.UNIFORM_BUFFER, .TRANSFER_DST}
-	for i in 0 ..< FRAMES_IN_FLIGHT {
-		vk_check(
-			vma.create_buffer(
-				r.allocators.gpu,
-				buffer_info,
-				vma_info,
-				&r.camera_buffers[i].buffer,
-				&r.camera_buffers[i].allocation,
-				nil,
-			),
-		)
-	}
-
-	buffer_info.size = vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * MAX_INDIRECT_DRAW)
-	buffer_info.usage = {.TRANSFER_DST, .INDIRECT_BUFFER}
-	for i in 0 ..< FRAMES_IN_FLIGHT {
-		vk_check(
-			vma.create_buffer(
-				r.allocators.gpu,
-				buffer_info,
-				vma_info,
-				&r.indirect_buffers[i].buffer,
-				&r.indirect_buffers[i].allocation,
-				nil,
-			),
-		)
-	}
-
-	buffer_info.size = vk.DeviceSize(size_of(Vertex) * MAX_VERTICES)
-	buffer_info.usage = {.STORAGE_BUFFER, .TRANSFER_DST}
-	vk_check(
-		vma.create_buffer(
-			r.allocators.gpu,
-			buffer_info,
-			vma_info,
-			&r.global_vertex_buffer.buffer,
-			&r.global_vertex_buffer.allocation,
-			nil,
-		),
-	)
-
-	buffer_info.size = vk.DeviceSize(size_of(u32) * MAX_INDICES)
-	buffer_info.usage = {.INDEX_BUFFER, .TRANSFER_DST}
-	vk_check(
-		vma.create_buffer(
-			r.allocators.gpu,
-			buffer_info,
-			vma_info,
-			&r.global_index_buffer.buffer,
-			&r.global_index_buffer.allocation,
-			nil,
-		),
-	)
 
 	return true
 }
@@ -1756,38 +1719,29 @@ create_buffers :: proc() -> (ok: bool) {
 @(private)
 destroy_buffers :: proc() {
 	for buf in r.object_buffers {
+		vma.unmap_memory(r.allocators.gpu, buf.allocation)
 		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
 	}
-	for buf in r.camera_buffers {
+	for buf in r.global_data_buffers {
+		vma.unmap_memory(r.allocators.gpu, buf.allocation)
 		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
 	}
 	for buf in r.indirect_buffers {
+		vma.unmap_memory(r.allocators.gpu, buf.allocation)
 		vma.destroy_buffer(r.allocators.gpu, buf.buffer, buf.allocation)
 	}
-	vma.destroy_buffer(
-		r.allocators.gpu,
-		r.global_vertex_buffer.buffer,
-		r.global_vertex_buffer.allocation,
-	)
-	vma.destroy_buffer(
-		r.allocators.gpu,
-		r.global_index_buffer.buffer,
-		r.global_index_buffer.allocation,
-	)
 }
 
 @(private)
 create_descriptor_pool :: proc() -> (ok: bool) {
 	pool_sizes: []vk.DescriptorPoolSize = {
-		{descriptorCount = FRAMES_IN_FLIGHT * 2, type = .STORAGE_BUFFER},
-		{descriptorCount = FRAMES_IN_FLIGHT, type = .UNIFORM_BUFFER},
 		{descriptorCount = FRAMES_IN_FLIGHT * 1024, type = .COMBINED_IMAGE_SAMPLER},
 	}
 
 	pool_info: vk.DescriptorPoolCreateInfo = {
 		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
 		flags         = {.UPDATE_AFTER_BIND},
-		maxSets       = FRAMES_IN_FLIGHT * MAX_MODELS,
+		maxSets       = 1,
 		poolSizeCount = u32(len(pool_sizes)),
 		pPoolSizes    = raw_data(pool_sizes),
 	}
@@ -1804,75 +1758,15 @@ destroy_descriptor_pool :: proc() {
 
 @(private)
 create_descriptor_sets :: proc(pipeline: GpuPipeline) -> (ok: bool) {
-	layouts := make([]vk.DescriptorSetLayout, FRAMES_IN_FLIGHT, r.allocators.cpu)
-	for i in 0 ..< FRAMES_IN_FLIGHT do layouts[i] = pipeline.descriptor_set_layout
-	defer delete(layouts)
+	layout := pipeline.descriptor_set_layout
 	alloc_info: vk.DescriptorSetAllocateInfo = {
 		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
 		descriptorPool     = r.descriptor_pool,
-		descriptorSetCount = FRAMES_IN_FLIGHT,
-		pSetLayouts        = raw_data(layouts),
+		descriptorSetCount = 1,
+		pSetLayouts        = &layout,
 	}
 
-	vk_check(
-		vk.AllocateDescriptorSets(r.device, &alloc_info, raw_data(r.global_descriptor_set[:])),
-	)
-
-	for i in 0 ..< FRAMES_IN_FLIGHT {
-		storage_buffer_info: vk.DescriptorBufferInfo = {
-			buffer = r.global_vertex_buffer.buffer,
-			offset = 0,
-			range  = vk.DeviceSize(vk.WHOLE_SIZE),
-		}
-		camera_buffer_info: vk.DescriptorBufferInfo = {
-			buffer = r.camera_buffers[i].buffer,
-			offset = 0,
-			range  = size_of(CameraData),
-		}
-		object_buffer_info: vk.DescriptorBufferInfo = {
-			buffer = r.object_buffers[i].buffer,
-			offset = 0,
-			range  = size_of(ObjectData) * MAX_MODELS,
-		}
-
-		descriptor_writes: []vk.WriteDescriptorSet = {
-			{
-				sType = .WRITE_DESCRIPTOR_SET,
-				dstSet = r.global_descriptor_set[i],
-				dstBinding = 0,
-				dstArrayElement = 0,
-				descriptorCount = 1,
-				descriptorType = .STORAGE_BUFFER,
-				pBufferInfo = &storage_buffer_info,
-			},
-			{
-				sType = .WRITE_DESCRIPTOR_SET,
-				dstSet = r.global_descriptor_set[i],
-				dstBinding = 1,
-				dstArrayElement = 0,
-				descriptorCount = 1,
-				descriptorType = .UNIFORM_BUFFER,
-				pBufferInfo = &camera_buffer_info,
-			},
-			{
-				sType = .WRITE_DESCRIPTOR_SET,
-				dstSet = r.global_descriptor_set[i],
-				dstBinding = 2,
-				dstArrayElement = 0,
-				descriptorCount = 1,
-				descriptorType = .STORAGE_BUFFER,
-				pBufferInfo = &object_buffer_info,
-			},
-		}
-
-		vk.UpdateDescriptorSets(
-			r.device,
-			u32(len(descriptor_writes)),
-			raw_data(descriptor_writes),
-			0,
-			nil,
-		)
-	}
+	vk_check(vk.AllocateDescriptorSets(r.device, &alloc_info, &r.global_descriptor_set))
 
 	return true
 }
@@ -2050,20 +1944,20 @@ record_command_buffer :: proc(image_index: int) {
 
 	vk.CmdBeginRendering(buf, &rendering_info)
 
-	vk.CmdBindIndexBuffer(buf, r.global_index_buffer.buffer, 0, .UINT32)
-
-	indirect_ptr: rawptr
-	vk_check(
-		vma.map_memory(
-			r.allocators.gpu,
-			r.indirect_buffers[frame_index].allocation,
-			&indirect_ptr,
-		),
+	view := glm.matrix4_look_at_f32({0, 4, 4}, {0, 0, 0}, {0, 0, 1})
+	proj := matrix4_perspective_z0_f32(
+		glm.to_radians(f32(45)),
+		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
+		0.01,
+		10,
 	)
-	defer vma.unmap_memory(r.allocators.gpu, r.indirect_buffers[frame_index].allocation)
+	global_data: GlobalData = {
+		view_proj = proj * view,
+	}
+	mem.copy(r.global_data_buffers[frame_index].mapped, rawptr(&global_data), size_of(GlobalData))
 
 	indirect_commands := slice.from_ptr(
-		cast(^vk.DrawIndexedIndirectCommand)indirect_ptr,
+		cast(^vk.DrawIndirectCommand)r.indirect_buffers[frame_index].mapped,
 		MAX_INDIRECT_DRAW,
 	)
 	indirect_count := 0
@@ -2077,12 +1971,12 @@ record_command_buffer :: proc(image_index: int) {
 	for &model, i in r.draw_info.models {
 		if model.material.pipeline != bound_pipeline_handle {
 			if indirect_count > 0 {
-				vk.CmdDrawIndexedIndirect(
+				vk.CmdDrawIndirect(
 					buf,
 					r.indirect_buffers[frame_index].buffer,
-					vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * total_drawn),
+					vk.DeviceSize(size_of(vk.DrawIndirectCommand) * total_drawn),
 					u32(indirect_count),
-					size_of(vk.DrawIndexedIndirectCommand),
+					size_of(vk.DrawIndirectCommand),
 				)
 				total_drawn += indirect_count
 				indirect_count = 0
@@ -2097,13 +1991,16 @@ record_command_buffer :: proc(image_index: int) {
 				bound_pipeline.layout,
 				0,
 				1,
-				&r.global_descriptor_set[frame_index],
+				&r.global_descriptor_set,
 				0,
 				nil,
 			)
 
 			push_constants: PushConstant = {
-				draw_index_offset = u32(total_drawn),
+				global_data_address   = r.global_data_buffers[frame_index].address,
+				object_buffer_address = vk.DeviceAddress(
+					u64(total_drawn * size_of(ObjectData)),
+				) + r.object_buffers[frame_index].address,
 			}
 			vk.CmdPushConstants(
 				buf,
@@ -2121,22 +2018,21 @@ record_command_buffer :: proc(image_index: int) {
 		}
 
 		indirect_commands[total_drawn + indirect_count] = {
-			indexCount    = current_mesh.index_count,
+			vertexCount   = current_mesh.index_count,
 			instanceCount = 1,
-			firstIndex    = u32(current_mesh.index_offset / size_of(u32)),
-			vertexOffset  = i32(current_mesh.vertex_offset / size_of(Vertex)),
+			firstVertex   = 0,
 			firstInstance = u32(i),
 		}
 		indirect_count += 1
 	}
 
 	if indirect_count > 0 {
-		vk.CmdDrawIndexedIndirect(
+		vk.CmdDrawIndirect(
 			buf,
 			r.indirect_buffers[frame_index].buffer,
-			vk.DeviceSize(size_of(vk.DrawIndexedIndirectCommand) * total_drawn),
+			vk.DeviceSize(size_of(vk.DrawIndirectCommand) * total_drawn),
 			u32(indirect_count),
-			size_of(vk.DrawIndexedIndirectCommand),
+			size_of(vk.DrawIndirectCommand),
 		)
 	}
 
@@ -2341,27 +2237,12 @@ matrix4_perspective_z0_f32 :: proc "contextless" (
 
 @(private)
 update_uniform_buffer :: proc() {
-	view := glm.matrix4_look_at_f32({0, 4, 4}, {0, 0, 0}, {0, 0, 1})
-	proj := matrix4_perspective_z0_f32(
-		glm.to_radians(f32(45)),
-		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
-		0.01,
-		10,
-	)
-
 	frame_index := current_frame()
 
-	data: rawptr
-	vma.map_memory(r.allocators.gpu, r.camera_buffers[frame_index].allocation, &data)
-	defer vma.unmap_memory(r.allocators.gpu, r.camera_buffers[frame_index].allocation)
-
-	camera_data: CameraData = {view, proj}
-	mem.copy(data, rawptr(&camera_data), size_of(CameraData))
-
-	object_data: rawptr
-	vma.map_memory(r.allocators.gpu, r.object_buffers[frame_index].allocation, &object_data)
-	defer vma.unmap_memory(r.allocators.gpu, r.object_buffers[frame_index].allocation)
-	objects := slice.from_ptr(cast(^ObjectData)object_data, len(r.draw_info.models))
+	objects := slice.from_ptr(
+		cast(^ObjectData)r.object_buffers[frame_index].mapped,
+		len(r.draw_info.models),
+	)
 
 	current_texture_handle: Handle
 	current_texture: ^GpuTexture
@@ -2371,8 +2252,11 @@ update_uniform_buffer :: proc() {
 			current_texture_handle = model.material.texture
 			current_texture = hm.dynamic_get(&r.textures, current_texture_handle)
 		}
+		mesh := hm.dynamic_get(&r.meshes, model.mesh)
 		objects[i].model = get_model_matrix(model)
 		objects[i].texture_id = current_texture.id
+		objects[i].vertex_address = mesh.buffer.address
+		objects[i].index_address = mesh.buffer.address + vk.DeviceAddress(mesh.index_offset)
 	}
 }
 
@@ -2481,7 +2365,7 @@ main :: proc() {
 
 	vertices, indices := load_model(MODEL_PATH)
 	mesh := create_gpu_mesh(vertices, indices)
-	texture := create_texture(TEXTURE_IMAGE)
+	texture := create_texture_from_filepath(TEXTURE_IMAGE)
 
 	render_loop: for {
 		e: sdl.Event
@@ -2504,8 +2388,22 @@ main :: proc() {
 				mesh,
 				{texture = texture, pipeline = default_pipeline()},
 				{},
-				{0, 0, elapsed_seconds()},
+				{0, 0, glm.to_radians(f32(45))},
 				{1, 1, 1},
+			)
+			draw_model(
+				mesh,
+				{texture = texture, pipeline = default_pipeline()},
+				{-2, 0, 0},
+				{0, 0, glm.to_radians(f32(45)) - 2 * elapsed_seconds()},
+				{0.5, 0.5, 0.5},
+			)
+			draw_model(
+				mesh,
+				{texture = texture, pipeline = default_pipeline()},
+				{2, 0, 0},
+				{0, 0, glm.to_radians(f32(45)) + 2 * elapsed_seconds()},
+				{0.5, 0.5, 0.5},
 			)
 		}
 	}
