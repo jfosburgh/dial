@@ -69,6 +69,10 @@ RenderTarget :: struct {
 	depth_format: vk.Format,
 }
 
+FrameDrawInfo :: struct {
+	models: [dynamic]Model,
+}
+
 Renderer :: struct {
 	allocators:                    Allocators,
 	odin_ctx:                      runtime.Context,
@@ -92,7 +96,7 @@ Renderer :: struct {
 	meshes:                        hm.Dynamic_Handle_Map(GpuMesh, Handle),
 	textures:                      hm.Dynamic_Handle_Map(GpuTexture, Handle),
 	graphics_pipelines:            hm.Dynamic_Handle_Map(GpuPipeline, Handle),
-	models:                        [3]Model,
+	default_pipeline:              Handle,
 	object_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
 	camera_buffers:                [FRAMES_IN_FLIGHT]AllocatedBuffer,
 	indirect_buffers:              [FRAMES_IN_FLIGHT]AllocatedBuffer,
@@ -101,6 +105,7 @@ Renderer :: struct {
 	vertex_buffer_offset:          u32,
 	index_buffer_offset:           u32,
 	global_descriptor_set:         [FRAMES_IN_FLIGHT]vk.DescriptorSet,
+	draw_info:                     FrameDrawInfo,
 }
 
 r: ^Renderer
@@ -131,10 +136,6 @@ Vertex :: struct {
 	_p3:   [2]f32,
 }
 
-UBO :: struct {
-	model, view, proj: matrix[4, 4]f32,
-}
-
 Handle :: struct {
 	idx, gen: u32,
 }
@@ -159,11 +160,15 @@ GpuPipeline :: struct {
 	handle:                Handle,
 }
 
+Material :: struct {
+	texture:  Handle,
+	pipeline: Handle,
+}
+
 Model :: struct {
 	pos, rot, scale: [3]f32,
-	mesh:            ^GpuMesh,
-	texture:         ^GpuTexture,
-	pipeline:        ^GpuPipeline,
+	mesh:            Handle,
+	material:        Material,
 }
 
 ObjectData :: struct {
@@ -180,6 +185,35 @@ CameraData :: struct {
 	view, proj: matrix[4, 4]f32,
 }
 
+@(deferred_none = end_drawing)
+begin_drawing :: proc() -> bool {
+	r.draw_info.models = make([dynamic]Model, r.allocators.temp)
+	return true
+}
+
+end_drawing :: proc() {
+	slice.sort_by(r.draw_info.models[:], proc(i, j: Model) -> bool {
+		return(
+			i.material.pipeline.idx < j.material.pipeline.idx &&
+			i.material.pipeline.gen == j.material.pipeline.gen \
+		)
+	})
+	draw_frame()
+	delete(r.draw_info.models)
+}
+
+default_pipeline :: proc() -> Handle {
+	return r.default_pipeline
+}
+
+elapsed_seconds :: proc() -> f32 {
+	return f32(time.duration_seconds(time.since(r.start_time)))
+}
+
+draw_model :: proc(mesh: Handle, material: Material, pos, rot, scale: [3]f32) {
+	append(&r.draw_info.models, Model{pos, rot, scale, mesh, material})
+}
+
 get_model_matrix :: proc(model: Model) -> glm.Matrix4f32 {
 	m := glm.MATRIX4F32_IDENTITY
 	m *= glm.matrix4_translate(model.pos)
@@ -191,7 +225,8 @@ get_model_matrix :: proc(model: Model) -> glm.Matrix4f32 {
 	return m
 }
 
-create_gpu_mesh :: proc(vertices: []Vertex, indices: []u32) -> (mesh: GpuMesh) {
+create_gpu_mesh :: proc(vertices: []Vertex, indices: []u32) -> (handle: Handle) {
+	mesh: GpuMesh
 	vertex_size := vk.DeviceSize(size_of(Vertex) * len(vertices))
 	index_size := vk.DeviceSize(size_of(u32) * len(indices))
 	mesh.vertex_offset = vk.DeviceSize(r.vertex_buffer_offset * size_of(Vertex))
@@ -215,6 +250,9 @@ create_gpu_mesh :: proc(vertices: []Vertex, indices: []u32) -> (mesh: GpuMesh) {
 	r.vertex_buffer_offset += u32(len(vertices))
 	r.index_buffer_offset += u32(len(indices))
 
+	log.debugf("uploaded %d vertices and %d indices", len(vertices), len(indices))
+
+	handle, _ = hm.dynamic_add(&r.meshes, mesh)
 	return
 }
 
@@ -245,6 +283,8 @@ load_model :: proc(filepath: string) -> ([]Vertex, []u32) {
 			append(&local_indices, vert_map[v])
 		}
 	}
+
+	log.debugf("loaded model from %s", filepath)
 
 	return slice.clone(
 		local_vertices[:],
@@ -1044,9 +1084,10 @@ destroy_descriptor_set_layout :: proc(layout: vk.DescriptorSetLayout) {
 create_graphics_pipeline :: proc(
 	descriptor_set_layout: vk.DescriptorSetLayout,
 ) -> (
-	pipeline: GpuPipeline,
+	handle: Handle,
 	ok: bool,
 ) #optional_ok {
+	pipeline: GpuPipeline
 	shader_code := #load(DEFAULT_SHADER)
 	shader_module := create_shader_module(shader_code)
 	defer vk.DestroyShaderModule(r.device, shader_module, nil)
@@ -1173,7 +1214,8 @@ create_graphics_pipeline :: proc(
 
 	vk_check(vk.CreateGraphicsPipelines(r.device, {}, 1, &pipeline_info, nil, &pipeline.pipeline))
 
-	return pipeline, true
+	handle, _ = hm.dynamic_add(&r.graphics_pipelines, pipeline)
+	return handle, true
 }
 
 @(private)
@@ -1485,9 +1527,10 @@ create_texture :: proc(
 	filepath: cstring,
 	mipped := true,
 ) -> (
-	texture: GpuTexture,
+	handle: Handle,
 	ok: bool,
 ) #optional_ok {
+	texture: GpuTexture
 	width, height, channels: i32
 	data := stbi.load(filepath, &width, &height, &channels, 4)
 	size := width * height * 4
@@ -1614,7 +1657,9 @@ create_texture :: proc(
 
 	vk.UpdateDescriptorSets(r.device, u32(len(writes)), raw_data(writes), 0, nil)
 
-	return texture, true
+	handle, _ = hm.dynamic_add(&r.textures, texture)
+	log.debugf("created texture from %s", filepath)
+	return handle, true
 }
 
 @(private)
@@ -1833,12 +1878,6 @@ create_descriptor_sets :: proc(pipeline: GpuPipeline) -> (ok: bool) {
 }
 
 @(private)
-destroy_descriptor_sets :: proc() {
-	for &model in r.models {
-	}
-}
-
-@(private)
 create_command_buffers :: proc() -> (ok: bool) {
 	alloc_info: vk.CommandBufferAllocateInfo = {
 		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
@@ -2030,9 +2069,13 @@ record_command_buffer :: proc(image_index: int) {
 	indirect_count := 0
 	total_drawn := 0
 
+	bound_pipeline_handle: Handle
 	bound_pipeline: ^GpuPipeline
-	for &model, i in r.models {
-		if model.pipeline != bound_pipeline {
+
+	current_mesh_handle: Handle
+	current_mesh: ^GpuMesh
+	for &model, i in r.draw_info.models {
+		if model.material.pipeline != bound_pipeline_handle {
 			if indirect_count > 0 {
 				vk.CmdDrawIndexedIndirect(
 					buf,
@@ -2045,7 +2088,8 @@ record_command_buffer :: proc(image_index: int) {
 				indirect_count = 0
 			}
 
-			bound_pipeline = model.pipeline
+			bound_pipeline_handle = model.material.pipeline
+			bound_pipeline = hm.dynamic_get(&r.graphics_pipelines, bound_pipeline_handle)
 			vk.CmdBindPipeline(buf, .GRAPHICS, bound_pipeline.pipeline)
 			vk.CmdBindDescriptorSets(
 				buf,
@@ -2071,11 +2115,16 @@ record_command_buffer :: proc(image_index: int) {
 			)
 		}
 
+		if current_mesh_handle != model.mesh {
+			current_mesh_handle = model.mesh
+			current_mesh = hm.dynamic_get(&r.meshes, current_mesh_handle)
+		}
+
 		indirect_commands[total_drawn + indirect_count] = {
-			indexCount    = model.mesh.index_count,
+			indexCount    = current_mesh.index_count,
 			instanceCount = 1,
-			firstIndex    = u32(model.mesh.index_offset / size_of(u32)),
-			vertexOffset  = i32(model.mesh.vertex_offset / size_of(Vertex)),
+			firstIndex    = u32(current_mesh.index_offset / size_of(u32)),
+			vertexOffset  = i32(current_mesh.vertex_offset / size_of(Vertex)),
 			firstInstance = u32(i),
 		}
 		indirect_count += 1
@@ -2163,11 +2212,6 @@ init_renderer :: proc(
 	hm.dynamic_init(&r.graphics_pipelines, r.allocators.cpu)
 	defer if !ok do hm.dynamic_destroy(&r.graphics_pipelines)
 
-	vertices, indices := load_model(MODEL_PATH)
-	defer delete(vertices)
-	defer delete(indices)
-	log.debugf("vertices: %d, indices: %d", len(vertices), len(indices))
-
 	init_window(window_config) or_return
 	defer if !ok do destroy_window()
 	log.debug("Window created")
@@ -2219,27 +2263,13 @@ init_renderer :: proc(
 	defer if !ok do destroy_descriptor_pool()
 	log.debug("Descriptor pool created")
 
-	pipeline, _ := hm.add(&r.graphics_pipelines, create_graphics_pipeline(layout))
+	pipeline, _ := create_graphics_pipeline(layout)
 	defer if !ok do destroy_graphics_pipeline(hm.get(&r.graphics_pipelines, pipeline)^)
+	r.default_pipeline = pipeline
 	log.debug("Graphics pipeline created")
 
 	create_descriptor_sets(hm.get(&r.graphics_pipelines, pipeline)^) or_return
-	defer if !ok do destroy_descriptor_sets()
 	log.debug("Descriptor sets created")
-
-	texture, _ := hm.add(&r.textures, create_texture(TEXTURE_IMAGE))
-	defer if !ok do destroy_texture(hm.get(&r.textures, texture))
-	log.debug("Texture image created")
-
-	mesh, _ := hm.add(&r.meshes, create_gpu_mesh(vertices, indices))
-	defer if !ok do destroy_gpu_mesh(hm.get(&r.meshes, mesh)^)
-	for &model, i in r.models {
-		model.scale = {1, 1, 1} / (f32(i + 1))
-		model.pos = {-2 + 2 * f32(i), 0, 0}
-		model.mesh = hm.get(&r.meshes, mesh)
-		model.texture = hm.get(&r.textures, texture)
-		model.pipeline = hm.get(&r.graphics_pipelines, pipeline)
-	}
 
 	create_command_buffers() or_return
 	log.debug("Command buffer created")
@@ -2262,7 +2292,6 @@ destroy_renderer :: proc() {
 		destroy_texture(texture)
 		hm.dynamic_remove(&r.textures, h)
 	}
-	destroy_descriptor_sets()
 	destroy_descriptor_pool()
 	destroy_buffers()
 	mesh_it := hm.dynamic_iterator_make(&r.meshes)
@@ -2312,7 +2341,6 @@ matrix4_perspective_z0_f32 :: proc "contextless" (
 
 @(private)
 update_uniform_buffer :: proc() {
-	elapsed := f32(time.duration_seconds(time.since(r.start_time)))
 	view := glm.matrix4_look_at_f32({0, 4, 4}, {0, 0, 0}, {0, 0, 1})
 	proj := matrix4_perspective_z0_f32(
 		glm.to_radians(f32(45)),
@@ -2333,13 +2361,18 @@ update_uniform_buffer :: proc() {
 	object_data: rawptr
 	vma.map_memory(r.allocators.gpu, r.object_buffers[frame_index].allocation, &object_data)
 	defer vma.unmap_memory(r.allocators.gpu, r.object_buffers[frame_index].allocation)
-	objects := slice.from_ptr(cast(^ObjectData)object_data, len(r.models))
+	objects := slice.from_ptr(cast(^ObjectData)object_data, len(r.draw_info.models))
 
-	for &model, i in r.models {
-		model.rot.z = elapsed
-		objects[i].model =
-			get_model_matrix(model) * glm.matrix4_rotate_f32(glm.to_radians(f32(90)), {0, 0, 1})
-		objects[i].texture_id = model.texture.id
+	current_texture_handle: Handle
+	current_texture: ^GpuTexture
+
+	for &model, i in r.draw_info.models {
+		if current_texture_handle != model.material.texture {
+			current_texture_handle = model.material.texture
+			current_texture = hm.dynamic_get(&r.textures, current_texture_handle)
+		}
+		objects[i].model = get_model_matrix(model)
+		objects[i].texture_id = current_texture.id
 	}
 }
 
@@ -2446,6 +2479,10 @@ main :: proc() {
 	if !init_renderer({window_title = "test window", app_id = "com.boondax.dial", width = WIDTH, height = HEIGHT, window_flags = {.VULKAN, .RESIZABLE}}, context.allocator) do return
 	defer destroy_renderer()
 
+	vertices, indices := load_model(MODEL_PATH)
+	mesh := create_gpu_mesh(vertices, indices)
+	texture := create_texture(TEXTURE_IMAGE)
+
 	render_loop: for {
 		e: sdl.Event
 		event_loop: for sdl.PollEvent(&e) {
@@ -2462,6 +2499,14 @@ main :: proc() {
 			}
 		}
 
-		draw_frame()
+		if begin_drawing() {
+			draw_model(
+				mesh,
+				{texture = texture, pipeline = default_pipeline()},
+				{},
+				{0, 0, elapsed_seconds()},
+				{1, 1, 1},
+			)
+		}
 	}
 }
