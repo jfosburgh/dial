@@ -104,7 +104,6 @@ load_font :: proc(filepath: string, font_size: f32) -> (font_out: Font, ok: bool
 	}
 	ttf.PackEnd(&ctx)
 
-	stbi.write_png("./font_test.png", atlas_width, atlas_height, 1, raw_data(bitmap), atlas_width)
 	font_handle, _ := create_texture_from_data(
 		raw_data(bitmap),
 		atlas_width,

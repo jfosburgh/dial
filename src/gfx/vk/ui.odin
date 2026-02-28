@@ -18,9 +18,9 @@ UiData :: struct {
 	border_edge:   f32,
 	texture_id:    u32,
 	primitive:     u32,
-	blur:          f32,
-	_pad:          [3]f32,
 	corner_radius: [4]f32,
+	softness:      f32,
+	_pad:          [3]u32,
 }
 
 UiPushConstant :: struct {
@@ -38,7 +38,8 @@ draw_text :: proc(
 	border_color: [4]f32 = {0, 0, 0, 0},
 	shadow_offset: [2]u8 = {0, 0},
 	shadow_color: [4]f32 = {0, 0, 0, 0.5},
-	shadow_blur_radius: u8 = 0,
+	softness: u8 = 0,
+	shadow_softness: u8 = 0,
 ) {
 	texture_id, ok := get_texture_id(font.texture)
 	if !ok do return
@@ -79,7 +80,6 @@ draw_text :: proc(
 			offset: [2]f32 = {f32(shadow_offset.x), f32(shadow_offset.y)}
 			shadow_rect := rect
 			shadow_rect.xy += offset
-			shadow_rect.zw += offset
 
 			append(
 				&r.draw_info.ui_elements,
@@ -93,7 +93,7 @@ draw_text :: proc(
 					edge = f32(font.edge) / f32(255),
 					border_edge = (f32(font.edge) - f32(border_width) * font.pixel_dist_scale) /
 					f32(255),
-					blur = f32(shadow_blur_radius),
+					softness = f32(shadow_softness) / font.pixel_dist_scale,
 				},
 			)
 		}
@@ -110,7 +110,7 @@ draw_text :: proc(
 				edge = f32(font.edge) / f32(255),
 				border_edge = (f32(font.edge) - f32(border_width) * font.pixel_dist_scale) /
 				f32(255),
-				blur = f32(blur_radius),
+				softness = f32(softness) / font.pixel_dist_scale,
 			},
 		)
 
@@ -127,9 +127,10 @@ draw_rect :: proc(
 	blur_radius: f32 = 0,
 	shadow_offset: [2]f32 = {0, 0},
 	shadow_color: [4]f32 = {0, 0, 0, 0.5},
-	shadow_blur_radius: f32 = 0,
+	shadow_softness: f32 = 0,
 ) {
-	if shadow_offset != {0, 0} || shadow_blur_radius > 0 {
+	// if shadow_offset != {0, 0} {
+	if true {
 		shadow_rect := rect
 		shadow_rect.xy += shadow_offset
 
@@ -144,8 +145,8 @@ draw_rect :: proc(
 				primitive = u32(UiPrimitive.Rect),
 				edge = 0,
 				border_edge = 0,
-				blur = shadow_blur_radius,
 				corner_radius = corner_radius,
+				softness = shadow_softness,
 			},
 		)
 	}
@@ -161,7 +162,6 @@ draw_rect :: proc(
 			primitive = u32(UiPrimitive.Rect),
 			edge = border_width,
 			border_edge = 0,
-			blur = blur_radius,
 			corner_radius = corner_radius,
 		},
 	)

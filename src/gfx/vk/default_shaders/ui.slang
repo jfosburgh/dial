@@ -7,9 +7,9 @@ struct UiData {
   float borderEdge;
   uint textureId;
   uint primitive;
-  float blur;
-  float3 _pad;
   float4 cornerRadius;
+  float softness;
+  float3 _pad;
 };
 
 struct PushConstants {
@@ -29,11 +29,22 @@ struct VSOutput {
   nointerpolation uint primitive : DATA1;
   nointerpolation float edge : DATA2;
   nointerpolation float borderEdge : DATA3;
-  nointerpolation float blur : DATA4;
   nointerpolation float4 cornerRadius : DATA5;
   nointerpolation float2 rectSize : DATA6;
-  float2 localPos : DATA7;
+  float2 shapePos : DATA7;
+  nointerpolation float softness : DATA8;
 };
+
+float roundedRectangle(float2 p, float2 size, float4 cornerRadius) {
+  float2 halfSize = size * 0.5;
+  float2 centerP = p - halfSize;
+
+  float2 r = (centerP.x > 0.0) ? cornerRadius.yz : cornerRadius.xw;
+  float radius = (centerP.y > 0.0) ? r.y : r.x;
+
+  float2 q = abs(centerP) - halfSize + radius;
+  return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
 
 [shader("vertex")]
 VSOutput vertMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID) {
@@ -44,11 +55,17 @@ VSOutput vertMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID) {
                           float2(1.0, 1.0), float2(0.0, 1.0) };
 
   float2 localPos = positions[vertexID];
-  float2 screenPos = ui.rect.xy + localPos * ui.rect.zw;
-  float2 ndcPos = (screenPos / pc.screenSize) * 2.0 - 1.0;
 
-  float2 uvPos = float2(lerp(ui.uv.x, ui.uv.z, localPos.x),
-                        lerp(ui.uv.y, ui.uv.w, localPos.y));
+  float pad = ui.softness + 2.0;
+  float2 expandedSize = ui.rect.zw + float2(pad * 2.0);
+
+  float2 screenPos = (ui.rect.xy - float2(pad)) + localPos * expandedSize;
+  float2 ndcPos = (screenPos / pc.screenSize) * 2.0 - 1.0;
+  float2 shapePos = localPos * expandedSize - float2(pad);
+
+  float2 unpaddedNormPos = shapePos / ui.rect.zw;
+  float2 uvPos = float2(lerp(ui.uv.x, ui.uv.z, unpaddedNormPos.x),
+                        lerp(ui.uv.y, ui.uv.w, unpaddedNormPos.y));
 
   VSOutput output;
   output.pos = float4(ndcPos, 0.0, 1.0);
@@ -59,10 +76,10 @@ VSOutput vertMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID) {
   output.primitive = ui.primitive;
   output.edge = ui.edge;
   output.borderEdge = ui.borderEdge;
-  output.blur = ui.blur;
   output.cornerRadius = ui.cornerRadius;
   output.rectSize = ui.rect.zw;
-  output.localPos = localPos;
+  output.shapePos = shapePos;
+  output.softness = ui.softness;
 
   return output;
 }
@@ -73,28 +90,28 @@ Sampler2D textures[];
 [shader("fragment")]
 float4 fragMain(VSOutput vertIn) : SV_TARGET {
   if (vertIn.primitive == 0) {
-    float2 halfSize = vertIn.rectSize * 0.5;
-	float2 p = (vertIn.localPos - 0.5) * vertIn.rectSize;
-	float r = (p.x > 0.0) ? ((p.y > 0.0) ? vertIn.cornerRadius.z : vertIn.cornerRadius.y) : ((p.y > 0.0) ? vertIn.cornerRadius.w : vertIn.cornerRadius.x);
-	r = min(r, min(halfSize.x, halfSize.y));
-	float2 q = abs(p) - halfSize + r;
-	float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    float4 adjustedRadius = max(vertIn.cornerRadius + vertIn.softness, 0.0);
+    float dist =
+        roundedRectangle(vertIn.shapePos, vertIn.rectSize, adjustedRadius);
+    float smoothing = fwidth(dist) + vertIn.softness;
+    float shapeAlpha = 1.0 - smoothstep(-smoothing, smoothing, dist);
 
-	float smoothing = fwidth(dist) * (1.0 + vertIn.blur);
-	float totalAlpha = smoothstep(smoothing, -smoothing, dist);
-	float innerDist = dist + vertIn.edge;
-	float fillAlpha = smoothstep(smoothing, -smoothing, innerDist);
+    float innerAlpha =
+        1.0 - smoothstep(-smoothing, smoothing, dist + vertIn.edge);
 
-	float4 finalColor = lerp(vertIn.borderColor, vertIn.color, fillAlpha);
-	return float4(finalColor.rgb, finalColor.a * totalAlpha);
+    float4 finalColor = lerp(vertIn.borderColor, vertIn.color, innerAlpha);
+
+    return float4(finalColor.rgb, finalColor.a * shapeAlpha);
   } else {
     float dist = textures[vertIn.textureId].Sample(vertIn.uv).r;
 
-    float smoothing = fwidth(dist) * (1.0 + vertIn.blur);
-	float totalAlpha = smoothstep(vertIn.borderEdge - smoothing, vertIn.borderEdge + smoothing, dist);
-    float textAlpha = smoothstep(vertIn.edge - smoothing, vertIn.edge + smoothing, dist);
-	float4 finalColor = lerp(vertIn.borderColor, vertIn.color, textAlpha);
+    float smoothing = fwidth(dist) + vertIn.softness;
+    float totalAlpha = smoothstep(vertIn.borderEdge - smoothing,
+                                  vertIn.borderEdge + smoothing, dist);
+    float textAlpha =
+        smoothstep(vertIn.edge - smoothing, vertIn.edge + smoothing, dist);
+    float4 finalColor = lerp(vertIn.borderColor, vertIn.color, textAlpha);
 
-    return float4(finalColor.rgb, finalColor.a*totalAlpha);
+    return float4(finalColor.rgb, finalColor.a * totalAlpha);
   }
 }

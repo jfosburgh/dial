@@ -2479,10 +2479,13 @@ main :: proc() {
 			)
 			draw_rect(
 				rect = {30.0, 30.0, 470.0, 100.0},
-				color = {0.2, 0.2, 0.2, 1.0},
-				corner_radius = {10.0, 10.0, 10.0, 10.0},
+				color = {1, 1, 1, 1},
+				corner_radius = {20.0, 20.0, 20.0, 20.0},
 				border_width = 2.0,
 				border_color = {0, 0, 1, 1},
+				shadow_offset = {10, 10},
+				shadow_color = {0, 0, 0, 0.7},
+				shadow_softness = 5,
 			)
 			draw_text(
 				"Hello, Vulkan UI!",
@@ -2491,8 +2494,10 @@ main :: proc() {
 				{1, 0, 0, 1},
 				border_width = 2,
 				border_color = {0, 1, 0, 1},
-				shadow_offset = {3, 3},
-				shadow_blur_radius = 2,
+				shadow_offset = {5, 5},
+				shadow_color = {0, 0, 0, 1},
+				softness = 0,
+				shadow_softness = 50,
 			)
 		}
 	}
