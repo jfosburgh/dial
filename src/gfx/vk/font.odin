@@ -1,8 +1,8 @@
 package gfx
 
 import "core:log"
+import "core:math"
 import "core:os"
-import stbi "vendor:stb/image"
 import ttf "vendor:stb/truetype"
 
 
@@ -26,8 +26,8 @@ load_font :: proc(filepath: string, font_size: f32) -> (font_out: Font, ok: bool
 		log.fatalf("failed initializing font from %s", FONT_PATH)
 	}
 
-	atlas_width, atlas_height := i32(1024), i32(1024)
-	bitmap := make([]u8, 1024 * 1024)
+	atlas_width, atlas_height := i32(2048), i32(2048)
+	bitmap := make([]u8, 2048 * 2048)
 	defer delete(bitmap)
 
 	first_codepoint: i32 = 32
@@ -40,9 +40,9 @@ load_font :: proc(filepath: string, font_size: f32) -> (font_out: Font, ok: bool
 	}
 	ttf.PackSetOversampling(&ctx, 1, 1)
 
-	padding: i32 = 5
-	onedge: u8 = 180
-	pixel_dist_scale: f32 = f32(onedge) / 5
+	padding: i32 = i32(math.ceil(font_size / 8))
+	onedge: u8 = 128
+	pixel_dist_scale: f32 = f32(onedge) / f32(padding)
 
 	scale := ttf.ScaleForPixelHeight(font, font_size)
 	x_offset, y_offset, row_height: i32
@@ -109,8 +109,8 @@ load_font :: proc(filepath: string, font_size: f32) -> (font_out: Font, ok: bool
 		atlas_width,
 		atlas_height,
 		1,
-		false,
-		true,
+		mipped = false,
+		norm = true,
 	)
 
 	font_out = {

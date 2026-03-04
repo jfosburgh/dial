@@ -94,7 +94,6 @@ Renderer :: struct {
 	resize_requested:              bool,
 	start_time:                    time.Time,
 	render_target:                 RenderTarget,
-	// ui_target:                     UITarget,
 	msaa_samples:                  vk.SampleCountFlags,
 	meshes:                        hm.Dynamic_Handle_Map(GpuMesh, Handle),
 	textures:                      hm.Dynamic_Handle_Map(GpuTexture, Handle),
@@ -196,21 +195,21 @@ CameraData :: struct {
 	view, proj: matrix[4, 4]f32,
 }
 
-@(deferred_none = end_drawing)
-begin_drawing :: proc() -> bool {
+@(deferred_in = end_drawing)
+begin_drawing :: proc(view, proj: matrix[4, 4]f32) -> bool {
 	r.draw_info.models = make([dynamic]Model, r.allocators.temp)
 	r.draw_info.ui_elements = make([dynamic]UiData, r.allocators.temp)
 	return true
 }
 
-end_drawing :: proc() {
+end_drawing :: proc(view, proj: matrix[4, 4]f32) {
 	slice.sort_by(r.draw_info.models[:], proc(i, j: Model) -> bool {
 		return(
 			i.material.pipeline.idx < j.material.pipeline.idx &&
 			i.material.pipeline.gen == j.material.pipeline.gen \
 		)
 	})
-	draw_frame()
+	draw_frame(view, proj)
 	delete(r.draw_info.models)
 	delete(r.draw_info.ui_elements)
 }
@@ -346,6 +345,14 @@ current_frame :: proc() -> uint {
 
 request_resize :: proc() {
 	r.resize_requested = true
+}
+
+window :: proc() -> ^sdl.Window {
+	return r.window
+}
+
+aspect :: proc() -> f32 {
+	return f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height)
 }
 
 @(private)
@@ -1127,7 +1134,7 @@ create_graphics_pipeline :: proc() -> (handle: Handle, ok: bool) #optional_ok {
 	pb_add_shaders(&b, vert_stage_info, frag_stage_info)
 	pb_set_descriptor_set_layout(&b, r.global_descriptor_set_layout)
 	pb_set_input_topology(&b, .TRIANGLE_LIST)
-	pb_set_cull_mode(&b, {.BACK}, .COUNTER_CLOCKWISE)
+	pb_set_cull_mode(&b, {.BACK}, .CLOCKWISE)
 	pb_set_polygon_mode(&b, .FILL, 1)
 	pb_enable_multisampling(&b, r.msaa_samples, 1)
 	pb_set_color_format(&b, r.render_target.color_format)
@@ -1206,17 +1213,6 @@ create_color_resources :: proc() -> (ok: bool) {
 		1,
 		r.msaa_samples,
 	)
-
-	// r.ui_target.format = r.swapchain.format
-	// create_image(
-	// 	&r.ui_target.color,
-	// 	r.swapchain.extent.width,
-	// 	r.swapchain.extent.height,
-	// 	r.ui_target.format,
-	// 	{.TRANSIENT_ATTACHMENT, .COLOR_ATTACHMENT},
-	// 	1,
-	// 	r.msaa_samples,
-	// )
 
 	return true
 }
@@ -1493,12 +1489,13 @@ create_buffer :: proc(buffer: ^AllocatedBuffer, size: u32, usage: vk.BufferUsage
 	}
 }
 
-@(private)
 create_texture_from_data :: proc(
 	data: rawptr,
 	width, height, channels: i32,
 	mipped := true,
 	norm := false,
+	filter_mode: vk.Filter = .LINEAR,
+	mipmap_mode: vk.SamplerMipmapMode = .LINEAR,
 ) -> (
 	handle: Handle,
 	ok: bool,
@@ -1586,9 +1583,9 @@ create_texture_from_data :: proc(
 
 	sampler_info: vk.SamplerCreateInfo = {
 		sType                   = .SAMPLER_CREATE_INFO,
-		magFilter               = .LINEAR,
-		minFilter               = .LINEAR,
-		mipmapMode              = .LINEAR,
+		magFilter               = filter_mode,
+		minFilter               = filter_mode,
+		mipmapMode              = mipmap_mode,
 		mipLodBias              = 0,
 		minLod                  = 0,
 		maxLod                  = vk.LOD_CLAMP_NONE,
@@ -1633,11 +1630,12 @@ create_texture_from_data :: proc(
 	return handle, true
 }
 
-@(private)
 create_texture_from_filepath :: proc(
 	filepath: cstring,
 	mipped := true,
 	norm := false,
+	filter_mode: vk.Filter = .LINEAR,
+	mipmap_mode: vk.SamplerMipmapMode = .LINEAR,
 ) -> (
 	handle: Handle,
 	ok: bool,
@@ -1651,7 +1649,7 @@ create_texture_from_filepath :: proc(
 	}
 	defer stbi.image_free(data)
 
-	return create_texture_from_data(data, width, height, 4, mipped, norm)
+	return create_texture_from_data(data, width, height, 4, mipped, norm, filter_mode, mipmap_mode)
 }
 
 get_texture_id :: proc(t: Handle) -> (id: u32, ok: bool) {
@@ -1861,7 +1859,11 @@ end_frame :: proc(buf: vk.CommandBuffer, image_index: int) {
 }
 
 @(private)
-record_command_buffer_3d :: proc(buf: vk.CommandBuffer, image_index: int) {
+record_command_buffer_3d :: proc(
+	buf: vk.CommandBuffer,
+	image_index: int,
+	view, proj: matrix[4, 4]f32,
+) {
 	frame_index := current_frame()
 	transition_image(
 		buf,
@@ -1942,13 +1944,6 @@ record_command_buffer_3d :: proc(buf: vk.CommandBuffer, image_index: int) {
 
 	vk.CmdBeginRendering(buf, &rendering_info)
 
-	view := glm.matrix4_look_at_f32({0, 4, 4}, {0, 0, 0}, {0, 0, 1})
-	proj := matrix4_perspective_z0_f32(
-		glm.to_radians(f32(45)),
-		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
-		0.01,
-		10,
-	)
 	global_data: GlobalData = {
 		view_proj = proj * view,
 	}
@@ -2326,7 +2321,7 @@ update_uniform_buffer :: proc() {
 	}
 }
 
-draw_frame :: proc() {
+draw_frame :: proc(view, proj: matrix[4, 4]f32) {
 	if r.resize_requested {
 		recreate_swapchain()
 		r.resize_requested = false
@@ -2358,7 +2353,7 @@ draw_frame :: proc() {
 	update_uniform_buffer()
 
 	buf := prepare_frame(int(image_index))
-	record_command_buffer_3d(buf, int(image_index))
+	record_command_buffer_3d(buf, int(image_index), view, proj)
 	record_command_buffer_ui(buf, int(image_index))
 	end_frame(buf, int(image_index))
 
@@ -2436,8 +2431,18 @@ main :: proc() {
 	mesh := create_gpu_mesh(vertices, indices)
 	texture := create_texture_from_filepath(TEXTURE_IMAGE)
 
-	ui_font, _ := load_font(FONT_PATH, 64)
+	ui_font, _ := load_font(FONT_PATH, 24)
 	defer delete(ui_font.chars)
+
+	init_ui()
+
+	view := glm.matrix4_look_at_f32({4, 0, 4}, {0, 0, 0}, {0, 1, 0})
+	proj := matrix4_perspective_z0_f32(
+		glm.to_radians(f32(45)),
+		f32(r.swapchain.extent.width) / f32(r.swapchain.extent.height),
+		0.1,
+		10,
+	)
 
 	render_loop: for {
 		e: sdl.Event
@@ -2455,7 +2460,7 @@ main :: proc() {
 			}
 		}
 
-		if begin_drawing() {
+		if begin_drawing(view, proj) {
 			draw_model(
 				mesh,
 				{texture = texture, pipeline = default_pipeline()},
@@ -2491,14 +2496,20 @@ main :: proc() {
 				"Hello, Vulkan UI!",
 				{50, 50},
 				ui_font,
+				24,
 				{1, 0, 0, 1},
-				border_width = 2,
-				border_color = {0, 1, 0, 1},
-				shadow_offset = {5, 5},
-				shadow_color = {0, 0, 0, 1},
-				softness = 0,
-				shadow_softness = 50,
+				softness = 2,
+				// border_width = 2,
+				// border_color = {0, 1, 0, 1},
+				// shadow_offset = {5, 5},
+				// shadow_color = {0, 0, 0, 1},
+				// softness = 0,
+				// shadow_softness = 50,
 			)
+			// ui_begin()
+			// defer ui_end()
+			//
+			// basic_ui_window()
 		}
 	}
 }
