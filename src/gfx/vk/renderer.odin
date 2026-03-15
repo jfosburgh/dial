@@ -53,6 +53,7 @@ RenderTarget :: struct {
 	color_format: vk.Format,
 	depth_format: vk.Format,
 	msaa_samples: vk.SampleCountFlags,
+	extent:       vk.Extent2D,
 }
 
 FrameDrawInfo :: struct {
@@ -589,7 +590,6 @@ destroy_command_pool :: proc() {
 	vk.DestroyCommandPool(r.device, r.command_pool, nil)
 }
 
-@(private)
 has_stencil_component :: proc(format: vk.Format) -> bool {
 	return format == .D32_SFLOAT_S8_UINT || format == .D24_UNORM_S8_UINT
 }

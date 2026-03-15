@@ -5,10 +5,9 @@ import sdl "vendor:sdl3"
 
 
 Context :: struct {
-	window:          ^sdl.Window,
 	keys:            Keys,
 	mouse:           MouseState,
-	resize_callback: #type proc(),
+	resize_callback: #type proc(_: sdl.WindowID),
 	quit_callback:   #type proc(),
 }
 
@@ -30,23 +29,19 @@ Keys :: map[sdl.Scancode]KeyState
 c: ^Context
 
 init_input :: proc(
-	window: ^sdl.Window,
 	quit_callback: proc(),
-	resize_callback: proc(),
+	resize_callback: proc(_: sdl.WindowID),
 	allocator := context.allocator,
 	loc := #caller_location,
 ) -> bool {
 	if c != nil do return false
 
 	c = new(Context, allocator, loc)
-	c.window = window
 	c.quit_callback = quit_callback
 	c.resize_callback = resize_callback
 	c.keys = make(map[sdl.Scancode]KeyState, allocator)
 
-	log.info("Input initialized")
-
-	sdl.SetWindowRelativeMouseMode(window, true) or_return
+	log.debug("Input initialized")
 
 	return true
 }
@@ -57,7 +52,7 @@ destroy_input :: proc() {
 	c = nil
 }
 
-update_input :: proc() -> (quit: bool) {
+update_input :: proc() {
 	for code in c.keys {
 		#partial switch c.keys[code] {
 		case .JustReleased:
@@ -75,11 +70,9 @@ update_input :: proc() -> (quit: bool) {
 		case .QUIT:
 			c.quit_callback()
 			log.debug("SDL requested quit")
-			return true
+			return
 		case .WINDOW_RESIZED:
-			w, h: i32
-			sdl.GetWindowSize(c.window, &w, &h)
-			c.resize_callback()
+			c.resize_callback(e.window.windowID)
 		case .KEY_DOWN:
 			c.keys[e.key.scancode] = .JustPressed
 		case .KEY_UP:
@@ -91,8 +84,6 @@ update_input :: proc() -> (quit: bool) {
 			c.mouse.y_rel += e.motion.yrel
 		}
 	}
-
-	return
 }
 
 get_axis_1d :: proc(left, right: sdl.Scancode) -> (axis: f32) {

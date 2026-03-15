@@ -243,7 +243,7 @@ get_physical_device_info :: proc(
 		   .GRAPHICS in family.queueFlags &&
 		   .TRANSFER in family.queueFlags {
 			present_supported: b32
-			vk.GetPhysicalDeviceSurfaceSupportKHR(device, u32(i), r.surface, &present_supported)
+			vk.GetPhysicalDeviceSurfaceSupportKHR(device, u32(i), surface, &present_supported)
 			if present_supported {
 				index := u32(i)
 				info.queue_families = {
@@ -302,7 +302,7 @@ get_physical_device_info :: proc(
 				return info, false
 			}
 
-			info.swapchain_support.formats = make([]vk.SurfaceFormatKHR, count, r.allocators.cpu)
+			info.swapchain_support.formats = make([]vk.SurfaceFormatKHR, count, allocator)
 			vk.GetPhysicalDeviceSurfaceFormatsKHR(
 				device,
 				surface,
@@ -319,11 +319,7 @@ get_physical_device_info :: proc(
 				return info, false
 			}
 
-			info.swapchain_support.present_modes = make(
-				[]vk.PresentModeKHR,
-				count,
-				r.allocators.cpu,
-			)
+			info.swapchain_support.present_modes = make([]vk.PresentModeKHR, count, allocator)
 			vk.GetPhysicalDeviceSurfacePresentModesKHR(
 				device,
 				surface,

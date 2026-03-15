@@ -59,12 +59,12 @@ create_swapchain :: proc(
 		clipped               = true,
 	}
 
-	indices: [2]u32 = {r.graphics_index, r.present_index}
-	if r.graphics_index != r.present_index {
-		swapchain_create_info.imageSharingMode = .CONCURRENT
-		swapchain_create_info.queueFamilyIndexCount = 2
-		swapchain_create_info.pQueueFamilyIndices = raw_data(indices[:])
-	}
+	// indices: [2]u32 = {r.graphics_index, r.present_index}
+	// if r.graphics_index != r.present_index {
+	// 	swapchain_create_info.imageSharingMode = .CONCURRENT
+	// 	swapchain_create_info.queueFamilyIndexCount = 2
+	// 	swapchain_create_info.pQueueFamilyIndices = raw_data(indices[:])
+	// }
 
 	vk_check(vk.CreateSwapchainKHR(device, &swapchain_create_info, nil, &swapchain.handle))
 	defer if !ok do vk.DestroySwapchainKHR(device, swapchain.handle, nil)
@@ -196,7 +196,7 @@ recreate_swapchain :: proc(
 	}
 
 	for width == 0 || height == 0 {
-		sdl.GetWindowSize(r.window, &width, &height)
+		sdl.GetWindowSize(window, &width, &height)
 		for sdl.WaitEvent(nil) {}
 	}
 
@@ -284,7 +284,7 @@ create_depth_resources :: proc(
 ) -> (
 	ok: bool,
 ) {
-	r.render_target.depth_format = find_depth_format(physical_device)
+	render_target.depth_format = find_depth_format(physical_device)
 	create_image(
 		device,
 		&render_target.depth,

@@ -4,6 +4,7 @@ import gfx "./gfx/vk"
 import "base:runtime"
 import "core:log"
 import "core:mem"
+import "input"
 import vma "shared:vma"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
@@ -35,15 +36,16 @@ ImmediateContext :: struct {
 }
 
 WindowContext :: struct {
-	window:           ^sdl.Window,
-	surface:          vk.SurfaceKHR,
-	swapchain:        gfx.Swapchain,
-	render_target:    gfx.RenderTarget,
-	pool:             vk.CommandPool,
-	frames:           [FRAMES_IN_FLIGHT]gfx.FrameData,
-	initialized:      bool,
-	frame_index:      uint,
-	resize_requested: bool,
+	window:                ^sdl.Window,
+	surface:               vk.SurfaceKHR,
+	swapchain:             gfx.Swapchain,
+	swapchain_image_index: u32,
+	render_target:         gfx.RenderTarget,
+	pool:                  vk.CommandPool,
+	frames:                [FRAMES_IN_FLIGHT]gfx.FrameData,
+	initialized:           bool,
+	frame_index:           uint,
+	resize_requested:      bool,
 }
 
 DescriptorContext :: struct {
@@ -56,8 +58,10 @@ Engine :: struct {
 	odin_ctx:                  OdinContext,
 	vk_ctx:                    VkContext,
 	imm_ctx:                   ImmediateContext,
-	primary_window:            WindowContext,
+	windows:                   map[sdl.WindowID]WindowContext,
+	primary_window:            sdl.WindowID,
 	global_texture_descriptor: DescriptorContext,
+	quit_requested:            bool,
 }
 
 e: ^Engine
@@ -84,18 +88,29 @@ init_engine :: proc(
 
 	e = new(Engine, allocator, loc)
 	e.odin_ctx = {allocator, temp_allocator, context}
+	e.windows = make(map[sdl.WindowID]WindowContext, allocator)
 
 	init_sdl(render_config.app_name, sdl_flags) or_return
 	defer if !ok do cleanup_sdl()
+	log.debug("SDL initialized")
+
+	input.init_input(request_quit, resize_window, e.odin_ctx.allocator) or_return
+	defer if !ok do input.destroy_input()
+	log.debug("Input initialized")
 
 	init_renderer(render_config, allocator) or_return
 	defer if !ok do cleanup_renderer()
+	log.debug("Vulkan context initialized")
 
-	create_window(window_config, &e.primary_window) or_return
-	defer if !ok do destroy_window(&e.primary_window)
+	if !render_config.headless {
+		e.primary_window = create_window(window_config) or_return
+		log.debug("Primary window created")
+	}
+	defer if !ok && !render_config.headless do destroy_window(e.primary_window)
 
 	create_global_texture_descriptors()
 	defer if !ok do destroy_global_texture_descriptors()
+	log.debug("Global texture descriptors created")
 
 	return true
 }
@@ -104,11 +119,29 @@ destroy_engine :: proc() {
 	if e == nil do return
 
 	destroy_global_texture_descriptors()
-	if e.primary_window.initialized do destroy_window(&e.primary_window)
+	if e.primary_window != {} do destroy_window(e.primary_window)
 	cleanup_renderer()
+	input.destroy_input()
 	cleanup_sdl()
 
 	free(e)
+}
+
+should_quit :: proc() -> bool {
+	input.update_input()
+	return e.quit_requested
+}
+
+primary_window :: proc() -> ^WindowContext {
+	return &e.windows[e.primary_window]
+}
+
+resize_window :: proc(window_id: sdl.WindowID) {
+	if win_ctx, ok := &e.windows[window_id]; ok {
+		win_ctx.resize_requested = true
+	} else {
+		log.warnf("Requested resize of window %+v but not found in tracked windows", window_id)
+	}
 }
 
 RendererConfig :: struct {
@@ -307,6 +340,10 @@ init_sdl :: proc(app_id: cstring, flags: sdl.InitFlags) -> (ok: bool) {
 	return true
 }
 
+request_quit :: proc() {
+	e.quit_requested = true
+}
+
 @(private)
 cleanup_sdl :: proc() {
 	sdl.Vulkan_UnloadLibrary()
@@ -327,8 +364,14 @@ vk_check :: proc(res: vk.Result, loc := #caller_location) {
 	}
 }
 
-create_window :: proc(config: gfx.WindowConfig, win_ctx: ^WindowContext) -> (ok: bool) {
-	win_ctx.window = gfx.create_window(config)
+create_window :: proc(config: gfx.WindowConfig) -> (window_id: sdl.WindowID, ok: bool) {
+	window := gfx.create_window(config)
+	window_id = sdl.GetWindowID(window)
+	e.windows[window_id] = {}
+
+	win_ctx := &e.windows[window_id]
+	win_ctx.window = window
+
 	defer if !ok do gfx.destroy_window(win_ctx.window)
 
 	win_ctx.surface = gfx.create_window_surface(win_ctx.window, e.vk_ctx.instance) or_return
@@ -404,7 +447,8 @@ create_window :: proc(config: gfx.WindowConfig, win_ctx: ^WindowContext) -> (ok:
 	return
 }
 
-destroy_window :: proc(win_ctx: ^WindowContext) {
+destroy_window :: proc(window_id: sdl.WindowID) {
+	win_ctx := &e.windows[window_id]
 	for frame in win_ctx.frames {
 		vk.DestroyFence(e.vk_ctx.device, frame.fence, nil)
 		vk.DestroySemaphore(e.vk_ctx.device, frame.semaphore, nil)
@@ -416,6 +460,8 @@ destroy_window :: proc(win_ctx: ^WindowContext) {
 	vk.DestroySurfaceKHR(e.vk_ctx.instance, win_ctx.surface, nil)
 	gfx.destroy_window(win_ctx.window)
 	win_ctx.initialized = false
+
+	delete_key(&e.windows, window_id)
 }
 
 create_global_texture_descriptors :: proc() {
@@ -455,7 +501,7 @@ main :: proc() {
 
 	when ODIN_DEBUG {
 		log_level = .Debug
-		log_opts |= {.Date, .Time}
+		log_opts |= {.Date, .Time, .Short_File_Path}
 
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
@@ -480,5 +526,20 @@ main :: proc() {
 
 	context.logger = log.create_console_logger(log_level, log_opts, log_ident)
 
-	create_mesh([]f32{1, 2, 3}, {1, 2, 3})
+	if !init_engine({app_name = "com.boondax.dial", headless = false, vk_version = ._1_4}, {.VIDEO, .EVENTS}, {width = 960, height = 640, window_flags = {.VULKAN, .RESIZABLE}}) do return
+	defer destroy_engine()
+
+	for !should_quit() {
+		w := primary_window()
+		if buf, ok := begin_drawing(w); ok {
+			if begin_rendering(
+				buf,
+				w.render_target.color,
+				w.render_target.depth,
+				w.swapchain.views[w.swapchain_image_index],
+			) {
+				// do stuff here
+			}
+		}
+	}
 }

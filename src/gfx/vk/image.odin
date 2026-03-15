@@ -9,6 +9,9 @@ AllocatedImage :: struct {
 	image:      vk.Image,
 	view:       vk.ImageView,
 	allocation: vma.Allocation,
+	format:     vk.Format,
+	samples:    vk.SampleCountFlags,
+	extent:     [3]u32,
 	mip_levels: u32,
 }
 
@@ -90,6 +93,9 @@ create_image :: proc(
 	}
 	vk_check(vk.CreateImageView(device, &view_info, nil, &image.view))
 	image.mip_levels = mip_levels
+	image.format = format
+	image.samples = msaa_samples
+	image.extent = {width, height, depth}
 
 	return true
 }
