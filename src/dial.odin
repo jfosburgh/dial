@@ -155,6 +155,8 @@ draw_instanced :: gpu.cmd_draw_instanced
 set_shaders :: gpu.cmd_set_shaders
 create_shader :: gpu.shader_create
 destroy_shader :: gpu.shader_destroy
+set_raster_state :: gpu.cmd_set_raster_state
+set_blend_state :: gpu.cmd_set_blend_state
 
 @(private)
 init_sdl :: proc(app_id: cstring, flags: sdl.InitFlags) -> (ok: bool) {
