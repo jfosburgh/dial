@@ -7,6 +7,7 @@ import sdl "vendor:sdl3"
 Context :: struct {
 	keys:            Keys,
 	mouse:           MouseState,
+	quit_key:        sdl.Scancode,
 	resize_callback: #type proc(_: sdl.WindowID),
 	quit_callback:   #type proc(),
 }
@@ -77,6 +78,10 @@ update_input :: proc() {
 			c.keys[e.key.scancode] = .JustPressed
 		case .KEY_UP:
 			c.keys[e.key.scancode] = .JustReleased
+			if c.quit_key != {} && c.quit_key == e.key.scancode {
+				c.quit_callback()
+				return
+			}
 		case .MOUSE_MOTION:
 			c.mouse.x_loc = e.motion.x
 			c.mouse.y_loc = e.motion.y
@@ -119,4 +124,12 @@ just_pressed :: proc(key: sdl.Scancode) -> bool {
 
 hide_mouse :: proc() {
 	_ = sdl.HideCursor()
+}
+
+set_quit_key :: proc(key: sdl.Scancode) {
+	c.quit_key = key
+}
+
+clear_quit_key :: proc() {
+	c.quit_key = {}
 }

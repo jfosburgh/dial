@@ -50,4 +50,56 @@ frame_submit :: proc(_: gpu.Texture, arena: ^gpu.Arena, buf: gpu.Command_Buffer,
 	gpu.swapchain_present(.Main, e.window.frame_sem, e.window.next_frame)
 	gpu.arena_free_all(arena)
 	e.window.next_frame += 1
+	free_all(e.odin_ctx.temp_allocator)
+}
+
+@(deferred_in = end_rendering)
+begin_rendering :: proc(buf: gpu.Command_Buffer, description: gpu.Render_Pass_Desc) -> bool {
+	gpu.cmd_begin_render_pass(buf, description)
+
+	return true
+}
+
+end_rendering :: proc(buf: gpu.Command_Buffer, _: gpu.Render_Pass_Desc) {
+	gpu.cmd_end_render_pass(buf)
+}
+
+RenderTargetBuilder :: struct {
+	color_attachment: gpu.Render_Attachment,
+	depth_attachment: gpu.Render_Attachment,
+}
+
+rtb_set_color_target :: proc(
+	b: ^RenderTargetBuilder,
+	texture: gpu.Texture,
+	clear_color: [4]f32,
+	view: gpu.Texture_View_Desc = {},
+	load_op: gpu.Load_Op = {},
+	store_op: gpu.Store_Op = {},
+) {
+	b.color_attachment.texture = texture
+	b.color_attachment.clear_color = clear_color
+	b.color_attachment.view = view
+	b.color_attachment.load_op = load_op
+	b.color_attachment.store_op = store_op
+}
+
+rtb_build_render_pass_desc :: proc(
+	b: ^RenderTargetBuilder,
+	allocator := e.odin_ctx.temp_allocator,
+) -> (
+	d: gpu.Render_Pass_Desc,
+) {
+	d.color_attachments = make([]gpu.Render_Attachment, 1, allocator)
+	d.color_attachments[0] = b.color_attachment
+
+	if b.depth_attachment != {} {
+		d.depth_attachment = b.depth_attachment
+	}
+
+	return
+}
+
+rtb_clear :: proc(b: ^RenderTargetBuilder) {
+	b^ = {}
 }

@@ -41,8 +41,10 @@ Engine :: struct {
 	delta:          f32,
 	headless:       bool,
 	quit_requested: bool,
+	shared_arena:   gpu.Arena,
 }
 
+@(private)
 e: ^Engine
 
 init_engine :: proc(
@@ -79,6 +81,7 @@ init_engine :: proc(
 	gpu.init(debug) or_return
 	defer if !ok do gpu.cleanup()
 	log.debug("Vulkan context initialized")
+	e.shared_arena = gpu.arena_init()
 
 	if !e.headless {
 		create_window(window_config) or_return
@@ -95,6 +98,8 @@ destroy_engine :: proc() {
 	if e == nil do return
 	gpu.wait_idle()
 
+	gpu.arena_destroy(&e.shared_arena)
+
 	if !e.headless do destroy_window()
 	gpu.cleanup()
 	input.destroy_input()
@@ -108,12 +113,48 @@ should_quit :: proc() -> bool {
 	return e.quit_requested
 }
 
+delta :: proc() -> f32 {
+	return e.delta
+}
+
 resize_window :: proc(window_id: sdl.WindowID) {
 	if window_id != e.window.id {
 		log.debugf("Received resize requested for non-existent window %+v", window_id)
 	}
 	e.window.resize_requested = true
 }
+
+create_shared_memory :: proc {
+	create_shared_memory_ptr,
+	create_shared_memory_slice,
+}
+
+create_shared_memory_ptr :: proc($T: typeid) -> gpu.ptr_t(T) {
+	return gpu.arena_alloc(&e.shared_arena, T)
+}
+
+create_shared_memory_slice :: proc($T: typeid, n: int) -> gpu.slice_t(T) {
+	return gpu.arena_alloc(&e.shared_arena, T, n)
+}
+
+create_shared_frame_memory :: proc {
+	create_shared_frame_memory_ptr,
+	create_shared_frame_memory_slice,
+}
+
+create_shared_frame_memory_ptr :: proc($T: typeid, arena: ^gpu.Arena) -> gpu.ptr_t(T) {
+	return gpu.arena_alloc(arena, T)
+}
+
+create_shared_frame_memory_slice :: proc($T: typeid, n: int, arena: ^gpu.Arena) -> gpu.slice_t(T) {
+	return gpu.arena_alloc(arena, T, n)
+}
+
+draw_indexed_instanced :: gpu.cmd_draw_indexed_instanced
+draw_instanced :: gpu.cmd_draw_instanced
+set_shaders :: gpu.cmd_set_shaders
+create_shader :: gpu.shader_create
+destroy_shader :: gpu.shader_destroy
 
 @(private)
 init_sdl :: proc(app_id: cstring, flags: sdl.InitFlags) -> (ok: bool) {
@@ -144,6 +185,7 @@ log_sdl :: proc() {
 	log.errorf("SDL Error: %s", sdl.GetError())
 }
 
+@(private)
 create_window :: proc(config: WindowConfig) -> (ok: bool) {
 	e.window.handle = sdl.CreateWindow(config.name, config.size.x, config.size.y, config.flags)
 	if e.window.handle == nil do return
@@ -163,12 +205,15 @@ create_window :: proc(config: WindowConfig) -> (ok: bool) {
 	return
 }
 
+@(private)
 destroy_window :: proc() {
 	for i in 0 ..< FRAMES_IN_FLIGHT do gpu.arena_destroy(&e.window.arenas[i])
 	gpu.semaphore_destroy(e.window.frame_sem)
 	sdl.DestroyWindow(e.window.handle)
 	e.window = {}
 }
+
+set_exit_key :: input.set_quit_key
 
 main :: proc() {
 	log_level: log.Level = .Info
@@ -204,6 +249,8 @@ main :: proc() {
 
 	if !init_engine({.VIDEO, .EVENTS}, {name = "Dial Example", size = {600, 600}, flags = {.VULKAN, .HIGH_PIXEL_DENSITY, .RESIZABLE}}, ODIN_DEBUG) do return
 	defer destroy_engine()
+
+	input.set_quit_key(.ESCAPE)
 
 	for !should_quit() {
 		input.update_input()
