@@ -1,6 +1,6 @@
 package dial
 
-import "shared:gpu"
+import "deps/no_gfx_api/gpu"
 import sdl "vendor:sdl3"
 
 @(private)

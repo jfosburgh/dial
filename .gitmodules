@@ -1,0 +1,3 @@
+[submodule "src/deps/no_gfx_api"]
+	path = src/deps/no_gfx_api
+	url = git@github.com:jfosburgh/no_gfx_api.git

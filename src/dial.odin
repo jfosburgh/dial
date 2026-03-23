@@ -1,10 +1,10 @@
 package dial
 
+import gpu "deps/no_gfx_api/gpu"
 import "base:runtime"
 import "core:log"
 import "core:mem"
 import "input"
-import gpu "shared:gpu"
 import sdl "vendor:sdl3"
 
 
